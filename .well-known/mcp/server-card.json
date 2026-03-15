@@ -1,0 +1,133 @@
+{
+  "serverInfo": {
+    "name": "Wire",
+    "version": "1.1.0"
+  },
+  "tools": [
+    {
+      "name": "wire_status",
+      "description": "Get Wire VPN status - shows if VPN is running, connected peers, and network info",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "wire_peers",
+      "description": "List all connected VPN peers with their endpoints and connection status",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "wire_install",
+      "description": "Get instructions to install Wire VPN on this machine",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "server_url": {
+            "type": "string",
+            "description": "Wire server URL (e.g., http://your-server:8786)"
+          }
+        },
+        "required": [
+          "server_url"
+        ]
+      }
+    },
+    {
+      "name": "wire_diagnose",
+      "description": "Diagnose Wire VPN issues - checks WireGuard installation, connectivity, and service status",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "wire_connect",
+      "description": "Get command to connect to a Wire VPN network",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "server_url": {
+            "type": "string",
+            "description": "Wire server URL (e.g., http://your-server:8786)"
+          },
+          "port": {
+            "type": "integer",
+            "description": "WireGuard listen port (default: 51820)",
+            "default": 51820
+          }
+        },
+        "required": [
+          "server_url"
+        ]
+      }
+    },
+    {
+      "name": "wire_add_node",
+      "description": "Add a new node to the Wire VPN network. Returns setup instructions.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "server_url": {
+            "type": "string",
+            "description": "Wire server URL"
+          },
+          "node_name": {
+            "type": "string",
+            "description": "Name for the new node (e.g., web1, db1)"
+          },
+          "public_ip": {
+            "type": "string",
+            "description": "Public IP if this is a relay node (optional)"
+          },
+          "port": {
+            "type": "integer",
+            "description": "WireGuard port (default: 51820)",
+            "default": 51820
+          }
+        },
+        "required": [
+          "server_url",
+          "node_name"
+        ]
+      }
+    },
+    {
+      "name": "wire_remove_node",
+      "description": "Remove a node from the Wire VPN network",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "node_name": {
+            "type": "string",
+            "description": "Name of the node to remove"
+          },
+          "vpn_ip": {
+            "type": "string",
+            "description": "VPN IP of the node (e.g., 10.99.x.x)"
+          }
+        },
+        "required": [
+          "node_name"
+        ]
+      }
+    },
+    {
+      "name": "wire_watchdog",
+      "description": "Check Wire VPN watchdog and auto-recovery status. Shows service health, stale peers, and recommendations.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    }
+  ],
+  "resources": [],
+  "prompts": []
+}
