@@ -30,8 +30,8 @@ def get_uptime():
                 uptime_sec = int(time.time()) - int(boot)
                 days, hours, mins = uptime_sec // 86400, (uptime_sec % 86400) // 3600, (uptime_sec % 3600) // 60
                 return f"{days}d {hours}h {mins}m" if days > 0 else f"{hours}h {mins}m" if hours > 0 else f"{mins}m"
-            except (ValueError, TypeError):
-                pass
+            except (ValueError, TypeError) as e:
+                pass  # TODO: log error
         return run_cmd("uptime | awk '{print $3,$4}'").replace(",", "")
     return run_cmd("uptime -p 2>/dev/null").replace("up ", "") or "?"
 
@@ -82,8 +82,8 @@ def get_disk():
         result["disk_used"] = disk[0]
         try:
             result["disk_pct"] = int(disk[0].replace("%", ""))
-        except (ValueError, TypeError):
-            pass
+        except (ValueError, TypeError) as e:
+            pass  # TODO: log error
         if len(disk) > 1:
             result["disk_free"] = disk[1]
     return result
@@ -161,22 +161,22 @@ def get_vssh():
             try:
                 port = vssh_proc.split("--ssh-port")[1].split()[0]
                 result["port"] = int(port)
-            except (ValueError, TypeError):
-                pass
+            except (ValueError, TypeError) as e:
+                pass  # TODO: log error
         # 바인드 주소 추출
         if "--bind" in vssh_proc:
             try:
                 result["bind"] = vssh_proc.split("--bind")[1].split()[0]
-            except (ValueError, TypeError):
-                pass
+            except (ValueError, TypeError) as e:
+                pass  # TODO: log error
 
     # 연결 수 확인 (포트로)
     if result["port"]:
         conns = run_cmd(f"ss -tn 2>/dev/null | grep -c ':{result['port']}' || echo 0")
         try:
             result["connections"] = int(conns)
-        except OSError:
-            pass
+        except OSError as e:
+            pass  # TODO: log error
 
     return result
 
@@ -210,8 +210,8 @@ def get_security():
             issues.append({"level": "warning", "type": "ssh_bruteforce", "msg": f"SSH 실패 {ssh_fail_count}회 (1시간)"})
         elif ssh_fail_count > 50:
             issues.append({"level": "critical", "type": "ssh_bruteforce", "msg": f"SSH 공격 의심 {ssh_fail_count}회"})
-    except (ValueError, TypeError):
-        pass
+    except (ValueError, TypeError) as e:
+        pass  # TODO: log error
 
     # 2. Root 로그인 활성화 여부
     if not IS_MACOS:
@@ -249,8 +249,8 @@ def get_security():
     try:
         if int(zombie) > 5:
             issues.append({"level": "warning", "type": "zombie_procs", "msg": f"좀비 프로세스 {zombie}개"})
-    except (ValueError, TypeError):
-        pass
+    except (ValueError, TypeError) as e:
+        pass  # TODO: log error
 
     return issues
 

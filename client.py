@@ -78,16 +78,16 @@ def detect_lan_ip() -> str:
                             ip = parts[idx]
                             if ip.startswith("192.168.") or (ip.startswith("10.") and not ip.startswith("10.99.")):
                                 return ip
-            except (subprocess.SubprocessError, OSError):
-                pass
+            except (subprocess.SubprocessError, OSError) as e:
+                pass  # TODO: log error
     try:
         r = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=2)
         if r.returncode == 0:
             for ip in r.stdout.split():
                 if ip.startswith("192.168.") or (ip.startswith("10.") and not ip.startswith("10.99.")):
                     return ip
-    except (subprocess.SubprocessError, OSError):
-        pass
+    except (subprocess.SubprocessError, OSError) as e:
+        pass  # TODO: log error
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -96,7 +96,7 @@ def detect_lan_ip() -> str:
         if not ip.startswith("10.99."):
             return ip
     except OSError:
-        pass
+        pass  # safe to ignore
     return ""
 
 
@@ -229,8 +229,8 @@ class WireGuardManager:
                         "allowed_ips": parts[3],
                         "latest_handshake": int(parts[4]) if parts[4] != "0" else 0,
                     }
-        except (subprocess.SubprocessError, OSError):
-            pass
+        except (subprocess.SubprocessError, OSError) as e:
+            pass  # TODO: log error
         return result
 
     def cleanup(self):

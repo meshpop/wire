@@ -61,7 +61,7 @@ def get_public_ip() -> str:
     try:
         with urllib.request.urlopen("https://api.ipify.org", timeout=5) as resp:
             return resp.read().decode().strip()
-    except:
+    except Exception:
         return "unknown"
 
 def get_local_ip() -> str:
@@ -72,7 +72,7 @@ def get_local_ip() -> str:
         ip = s.getsockname()[0]
         s.close()
         return ip
-    except:
+    except Exception:
         return "unknown"
 
 # Tool implementations
