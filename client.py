@@ -78,7 +78,7 @@ def detect_lan_ip() -> str:
                             ip = parts[idx]
                             if ip.startswith("192.168.") or (ip.startswith("10.") and not ip.startswith("10.99.")):
                                 return ip
-            except:
+            except (subprocess.SubprocessError, OSError):
                 pass
     try:
         r = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=2)
@@ -86,7 +86,7 @@ def detect_lan_ip() -> str:
             for ip in r.stdout.split():
                 if ip.startswith("192.168.") or (ip.startswith("10.") and not ip.startswith("10.99.")):
                     return ip
-    except:
+    except (subprocess.SubprocessError, OSError):
         pass
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -95,7 +95,7 @@ def detect_lan_ip() -> str:
         s.close()
         if not ip.startswith("10.99."):
             return ip
-    except:
+    except OSError:
         pass
     return ""
 
@@ -106,7 +106,7 @@ def is_same_subnet(ip1: str, ip2: str) -> bool:
         return False
     try:
         return ip1.rsplit(".", 1)[0] == ip2.rsplit(".", 1)[0]
-    except:
+    except Exception:
         return False
 
 
@@ -117,7 +117,7 @@ def generate_node_id() -> str:
         import uuid
         mac = uuid.getnode()
         return hashlib.sha256(f"{hostname}-{mac}".encode()).hexdigest()[:32]
-    except:
+    except OSError:
         return hashlib.sha256(hostname.encode()).hexdigest()[:32]
 
 
@@ -184,8 +184,8 @@ class WireGuardManager:
 
             run(f"wg setconf {utun_name} {conf_path}")
             run(f"ifconfig {utun_name} inet {vpn_ip} {vpn_ip} netmask 255.255.0.0")
-            run(f"route delete -net 10.99.x.x/16 2>/dev/null", check=False)
-            run(f"route add -net 10.99.x.x/16 -interface {utun_name}")
+            run(f"route delete -net 10.99.0.0/16 2>/dev/null", check=False)
+            run(f"route add -net 10.99.0.0/16 -interface {utun_name}")
             self.interface = utun_name
         else:
             run(f"ip link delete {self.interface} 2>/dev/null", check=False)
@@ -229,7 +229,7 @@ class WireGuardManager:
                         "allowed_ips": parts[3],
                         "latest_handshake": int(parts[4]) if parts[4] != "0" else 0,
                     }
-        except:
+        except (subprocess.SubprocessError, OSError):
             pass
         return result
 
@@ -348,7 +348,7 @@ class Wire:
                 p = peer_map[primary["vpn_ip"]]
                 endpoint = f"{p['public_ip']}:{p['port']}"
                 # Add to v1 for NAT node traffic
-                self.wg.add_peer(p["wg_public_key"], endpoint, "10.99.x.x/16")
+                self.wg.add_peer(p["wg_public_key"], endpoint, "10.99.0.0/16")
 
             return f"[RELAY] {count} VPS peers"
         else:
@@ -415,7 +415,7 @@ class Wire:
         relay = self._select_relay(peers, current_wg)
         if relay:
             endpoint = f"{relay['public_ip']}:{relay['port']}"
-            self.wg.add_peer(relay["wg_public_key"], endpoint, "10.99.x.x/16")
+            self.wg.add_peer(relay["wg_public_key"], endpoint, "10.99.0.0/16")
             self.current_relay = relay["vpn_ip"]
         else:
             self.current_relay = None

@@ -1,6 +1,6 @@
 import os
 #!/usr/bin/env python3
-"""Server Agent - Report server status to dashboard"""
+"""Server Agent - 서버 상태를 대시보드에 보고"""
 import subprocess
 import json
 import socket
@@ -19,7 +19,7 @@ def run_cmd(cmd, timeout=10):
     try:
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
         return result.stdout.strip()
-    except:
+    except (subprocess.SubprocessError, OSError):
         return ""
 
 def get_uptime():
@@ -30,7 +30,7 @@ def get_uptime():
                 uptime_sec = int(time.time()) - int(boot)
                 days, hours, mins = uptime_sec // 86400, (uptime_sec % 86400) // 3600, (uptime_sec % 3600) // 60
                 return f"{days}d {hours}h {mins}m" if days > 0 else f"{hours}h {mins}m" if hours > 0 else f"{mins}m"
-            except:
+            except (ValueError, TypeError):
                 pass
         return run_cmd("uptime | awk '{print $3,$4}'").replace(",", "")
     return run_cmd("uptime -p 2>/dev/null").replace("up ", "") or "?"
@@ -72,7 +72,7 @@ fi""")
 def get_disk():
     result = {"disk_used": "?", "disk_pct": 0, "disk_free": "?"}
     if IS_MACOS:
-        # macOS APFS: /System/Volumes/Data actual data volume
+        # macOS APFS: /System/Volumes/Data가 실제 데이터 볼륨
         disk = run_cmd("df -h /System/Volumes/Data 2>/dev/null | tail -1 | awk '{print $5, $4, $3, $2}'").split()
         if not disk or len(disk) < 2:
             disk = run_cmd("df -h / | tail -1 | awk '{print $5, $4, $3, $2}'").split()
@@ -82,7 +82,7 @@ def get_disk():
         result["disk_used"] = disk[0]
         try:
             result["disk_pct"] = int(disk[0].replace("%", ""))
-        except:
+        except (ValueError, TypeError):
             pass
         if len(disk) > 1:
             result["disk_free"] = disk[1]
@@ -149,33 +149,33 @@ def get_services():
     return services
 
 def get_vssh():
-    """Check vssh status"""
+    """vssh 상태 확인"""
     result = {"running": False, "port": 0, "connections": 0, "bind": ""}
 
-    # vssh  Verify
+    # vssh 프로세스 확인
     vssh_proc = run_cmd("pgrep -fa 'vssh.*server' 2>/dev/null | head -1")
     if vssh_proc:
         result["running"] = True
-        #  
+        # 포트 추출
         if "--ssh-port" in vssh_proc:
             try:
                 port = vssh_proc.split("--ssh-port")[1].split()[0]
                 result["port"] = int(port)
-            except:
+            except (ValueError, TypeError):
                 pass
-        #   
+        # 바인드 주소 추출
         if "--bind" in vssh_proc:
             try:
                 result["bind"] = vssh_proc.split("--bind")[1].split()[0]
-            except:
+            except (ValueError, TypeError):
                 pass
 
-    #   Verify ()
+    # 연결 수 확인 (포트로)
     if result["port"]:
         conns = run_cmd(f"ss -tn 2>/dev/null | grep -c ':{result['port']}' || echo 0")
         try:
             result["connections"] = int(conns)
-        except:
+        except OSError:
             pass
 
     return result
@@ -196,10 +196,10 @@ def get_firewall():
     return fw.strip() if fw else "unknown"
 
 def get_security():
-    """ """
+    """보안 점검"""
     issues = []
 
-    # 1. SSH    ( 1)
+    # 1. SSH 실패 로그인 시도 (최근 1시간)
     if IS_MACOS:
         ssh_fails = run_cmd("log show --predicate 'process == \"sshd\" && eventMessage contains \"Failed\"' --last 1h 2>/dev/null | wc -l").strip()
     else:
@@ -207,62 +207,62 @@ def get_security():
     try:
         ssh_fail_count = int(ssh_fails)
         if ssh_fail_count > 10:
-            issues.append({"level": "warning", "type": "ssh_bruteforce", "msg": f"SSH  {ssh_fail_count} (1)"})
+            issues.append({"level": "warning", "type": "ssh_bruteforce", "msg": f"SSH 실패 {ssh_fail_count}회 (1시간)"})
         elif ssh_fail_count > 50:
-            issues.append({"level": "critical", "type": "ssh_bruteforce", "msg": f"SSH   {ssh_fail_count}"})
-    except:
+            issues.append({"level": "critical", "type": "ssh_bruteforce", "msg": f"SSH 공격 의심 {ssh_fail_count}회"})
+    except (ValueError, TypeError):
         pass
 
-    # 2. Root   
+    # 2. Root 로그인 활성화 여부
     if not IS_MACOS:
         root_login = run_cmd("grep -E '^PermitRootLogin' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}'").strip()
         if root_login in ["yes", "without-password"]:
-            issues.append({"level": "info", "type": "ssh_root", "msg": "Root SSH "})
+            issues.append({"level": "info", "type": "ssh_root", "msg": "Root SSH 허용됨"})
 
-    # 3.    
+    # 3. 비밀번호 인증 활성화 여부
     if not IS_MACOS:
         pwd_auth = run_cmd("grep -E '^PasswordAuthentication' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}'").strip()
         if pwd_auth == "yes":
-            issues.append({"level": "info", "type": "ssh_password", "msg": "SSH   "})
+            issues.append({"level": "info", "type": "ssh_password", "msg": "SSH 비밀번호 인증 허용"})
 
-    # 4.    
-    dangerous_ports = {23: "Telnet", 21: "FTP", 3389: "RDP", 5900: "VNC", 6379: "Redis()", 27017: "MongoDB()"}
+    # 4. 위험한 포트 오픈 체크
+    dangerous_ports = {23: "Telnet", 21: "FTP", 3389: "RDP", 5900: "VNC", 6379: "Redis(외부)", 27017: "MongoDB(외부)"}
     open_ports = get_ports()
     for port, name in dangerous_ports.items():
         if port in open_ports:
-            issues.append({"level": "warning", "type": "dangerous_port", "msg": f"{name}  {port} "})
+            issues.append({"level": "warning", "type": "dangerous_port", "msg": f"{name} 포트 {port} 오픈"})
 
-    # 5.   
+    # 5. 디스크 공간 부족
     disk_pct = int(run_cmd("df / | tail -1 | awk '{print $5}' | tr -d '%'") or "0")
     if disk_pct > 90:
-        issues.append({"level": "critical", "type": "disk_full", "msg": f" {disk_pct}% "})
+        issues.append({"level": "critical", "type": "disk_full", "msg": f"디스크 {disk_pct}% 사용"})
     elif disk_pct > 80:
-        issues.append({"level": "warning", "type": "disk_warning", "msg": f" {disk_pct}% "})
+        issues.append({"level": "warning", "type": "disk_warning", "msg": f"디스크 {disk_pct}% 사용"})
 
-    # 6.  
+    # 6. 메모리 부족
     mem_info = get_memory()
     if mem_info.get("mem_pct", 0) > 90:
-        issues.append({"level": "warning", "type": "memory_high", "msg": f" {mem_info['mem_pct']}% "})
+        issues.append({"level": "warning", "type": "memory_high", "msg": f"메모리 {mem_info['mem_pct']}% 사용"})
 
-    # 7.  
+    # 7. 좀비 프로세스
     zombie = run_cmd("ps aux | grep -c ' Z ' 2>/dev/null || echo 0").strip()
     try:
         if int(zombie) > 5:
-            issues.append({"level": "warning", "type": "zombie_procs", "msg": f"  {zombie}"})
-    except:
+            issues.append({"level": "warning", "type": "zombie_procs", "msg": f"좀비 프로세스 {zombie}개"})
+    except (ValueError, TypeError):
         pass
 
     return issues
 
 def get_recent_logs():
-    """  """
+    """최근 로그 분석"""
     logs = []
 
     if IS_MACOS:
-        # macOS:  Error 
+        # macOS: 최근 에러 로그
         errors = run_cmd("log show --predicate 'messageType == error' --last 10m 2>/dev/null | tail -5")
     else:
-        # Linux: journalctl Error/Warning 
+        # Linux: journalctl에서 에러/경고 추출
         errors = run_cmd("journalctl -p err -n 10 --no-pager 2>/dev/null | tail -5")
 
     if errors:
@@ -270,19 +270,19 @@ def get_recent_logs():
             if line.strip():
                 logs.append({"level": "error", "msg": line.strip()[:100]})
 
-    # OOM Killer 
+    # OOM Killer 감지
     if not IS_MACOS:
         oom = run_cmd("dmesg 2>/dev/null | grep -i 'out of memory' | tail -1")
         if oom:
-            logs.append({"level": "critical", "msg": "OOM Killer : " + oom[:80]})
+            logs.append({"level": "critical", "msg": "OOM Killer 발생: " + oom[:80]})
 
-    #   
+    # 서비스 실패 감지
     if not IS_MACOS:
         failed_svc = run_cmd("systemctl --failed --no-pager 2>/dev/null | grep -E '●|failed' | head -3")
         if failed_svc and "0 loaded" not in failed_svc:
             for line in failed_svc.strip().split('\n'):
                 if line.strip():
-                    logs.append({"level": "warning", "msg": " : " + line.strip()[:60]})
+                    logs.append({"level": "warning", "msg": "서비스 실패: " + line.strip()[:60]})
 
     return logs
 
