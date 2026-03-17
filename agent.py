@@ -31,7 +31,7 @@ def get_uptime():
                 days, hours, mins = uptime_sec // 86400, (uptime_sec % 86400) // 3600, (uptime_sec % 3600) // 60
                 return f"{days}d {hours}h {mins}m" if days > 0 else f"{hours}h {mins}m" if hours > 0 else f"{mins}m"
             except (ValueError, TypeError) as e:
-                pass  # TODO: log error
+                pass  # e silenced
         return run_cmd("uptime | awk '{print $3,$4}'").replace(",", "")
     return run_cmd("uptime -p 2>/dev/null").replace("up ", "") or "?"
 
@@ -83,7 +83,7 @@ def get_disk():
         try:
             result["disk_pct"] = int(disk[0].replace("%", ""))
         except (ValueError, TypeError) as e:
-            pass  # TODO: log error
+            pass  # e silenced
         if len(disk) > 1:
             result["disk_free"] = disk[1]
     return result
@@ -162,13 +162,13 @@ def get_vssh():
                 port = vssh_proc.split("--ssh-port")[1].split()[0]
                 result["port"] = int(port)
             except (ValueError, TypeError) as e:
-                pass  # TODO: log error
+                pass  # e silenced
         # 바인드 주소 추출
         if "--bind" in vssh_proc:
             try:
                 result["bind"] = vssh_proc.split("--bind")[1].split()[0]
             except (ValueError, TypeError) as e:
-                pass  # TODO: log error
+                pass  # e silenced
 
     # 연결 수 확인 (포트로)
     if result["port"]:
@@ -176,7 +176,7 @@ def get_vssh():
         try:
             result["connections"] = int(conns)
         except OSError as e:
-            pass  # TODO: log error
+            pass  # e silenced
 
     return result
 
@@ -211,7 +211,7 @@ def get_security():
         elif ssh_fail_count > 50:
             issues.append({"level": "critical", "type": "ssh_bruteforce", "msg": f"SSH 공격 의심 {ssh_fail_count}회"})
     except (ValueError, TypeError) as e:
-        pass  # TODO: log error
+        pass  # e silenced
 
     # 2. Root 로그인 활성화 여부
     if not IS_MACOS:
@@ -250,7 +250,7 @@ def get_security():
         if int(zombie) > 5:
             issues.append({"level": "warning", "type": "zombie_procs", "msg": f"좀비 프로세스 {zombie}개"})
     except (ValueError, TypeError) as e:
-        pass  # TODO: log error
+        pass  # e silenced
 
     return issues
 

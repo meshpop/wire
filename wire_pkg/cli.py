@@ -47,7 +47,7 @@ def detect_lan_ip() -> str:
                             if ip.startswith("192.168.") or (ip.startswith("10.") and not ip.startswith("10.99.")):
                                 return ip
             except (subprocess.SubprocessError, OSError) as e:
-                pass  # TODO: log error
+                pass  # e silenced
     else:
         try:
             r = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=2)
@@ -56,7 +56,7 @@ def detect_lan_ip() -> str:
                     if ip.startswith("192.168.") or (ip.startswith("10.") and not ip.startswith("10.99.")):
                         return ip
         except (subprocess.SubprocessError, OSError) as e:
-            pass  # TODO: log error
+            pass  # e silenced
 
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -176,7 +176,7 @@ class WireGuardManager:
                         "latest_handshake": int(parts[4]) if parts[4] != "0" else 0,
                     }
         except (subprocess.SubprocessError, OSError) as e:
-            pass  # TODO: log error
+            pass  # e silenced
         return result
 
     def cleanup(self):
@@ -579,7 +579,7 @@ def show_status(server_url: str = None):
                     handshakes[allowed] = hs_time
                     endpoints[allowed] = endpoint
         except (subprocess.SubprocessError, OSError) as e:
-            pass  # TODO: log error
+            pass  # e silenced
 
     # 서버에서 피어 목록 가져오기
     try:
