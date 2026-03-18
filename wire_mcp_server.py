@@ -75,11 +75,79 @@ def get_local_ip() -> str:
     except Exception:
         return "unknown"
 
+
+def _find_wg_bin() -> str:
+    """Find wg binary — checks multiple locations."""
+    candidates = [
+        "/opt/homebrew/bin/wg",   # macOS arm (Apple Silicon)
+        "/usr/local/bin/wg",      # macOS x86 / manual install
+        "/usr/bin/wg",            # Linux
+        "wg",                     # PATH
+    ]
+    for c in candidates:
+        r = subprocess.run(["which", c.split("/")[-1]] if c == "wg" else ["test", "-x", c],
+                           capture_output=True)
+        if r.returncode == 0:
+            return c
+    return "wg"  # fallback — let shell find it
+
+def _find_wire_interface() -> str:
+    """
+    Detect the active WireGuard interface — no sudo required.
+
+    macOS/Linux: /var/run/wireguard/*.sock  (wireguard-go userspace)
+                 The socket filename IS the interface name.
+    Linux kernel: ip link show | grep wg / wire
+    Fallback:     wg show interfaces (may need sudo)
+    Returns "" if WireGuard is not running at all.
+    """
+    import glob
+
+    # ── Method 1: /var/run/wireguard/*.sock (most reliable, no sudo) ──
+    sock_files = glob.glob("/var/run/wireguard/*.sock")
+    if sock_files:
+        # pick the first one; sort for determinism
+        iface = os.path.basename(sorted(sock_files)[0]).replace(".sock", "")
+        return iface
+
+    # ── Method 2: wg show interfaces (sudo -n, non-interactive) ──────
+    wg = _find_wg_bin()
+    out = run_cmd(f"sudo -n {wg} show interfaces 2>/dev/null").strip()
+    if out and "sudo" not in out.lower() and "password" not in out.lower() and out:
+        ifaces = out.split()
+        if ifaces:
+            return ifaces[0]
+
+    # ── Method 3: Linux — ip link (no sudo) ──────────────────────────
+    if sys.platform != "darwin":
+        ip_out = run_cmd("ip link show 2>/dev/null")
+        for token in ip_out.split():
+            name = token.rstrip(":")
+            if name.startswith(("wg", "wire")):
+                return name
+
+    # ── Nothing found — WireGuard not running ────────────────────────
+    return ""
+
+def _wg_show(subcmd: str = "") -> str:
+    """Run 'wg show <interface> [subcmd]', auto-detecting wg path and interface."""
+    wg    = _find_wg_bin()
+    iface = _find_wire_interface()
+    cmd   = f"sudo -n {wg} show {iface}"
+    if subcmd:
+        cmd += f" {subcmd}"
+    out = run_cmd(cmd + " 2>/dev/null")
+    # If sudo -n fails (needs password), try without sudo
+    if "sudo" in out.lower() or "password" in out.lower():
+        out = run_cmd(f"{wg} show {iface}" + (f" {subcmd}" if subcmd else "") + " 2>/dev/null")
+    return out
+
+
 # Tool implementations
 def wire_status():
     """Get Wire VPN status"""
     is_macos = sys.platform == "darwin"
-    interface = "utun9" if is_macos else "wire0"
+    interface = _find_wire_interface()
 
     # Check if interface exists
     if is_macos:
@@ -90,15 +158,11 @@ def wire_status():
     if "does not exist" in iface_check or not iface_check.strip():
         return {
             "status": "not_running",
-            "message": "Wire VPN is not running",
-            "suggestion": "Run 'sudo python3 client.py --server http://SERVER:8786' to start"
+            "message": f"Wire VPN is not running (checked interface: {interface})",
+            "suggestion": "Run 'sudo python3 /opt/wire/client.py --server http://SERVER:8786' to start"
         }
 
-    # Get WireGuard status
-    wg_path = "/opt/homebrew/bin/wg" if is_macos else "wg"
-    wg_show = run_cmd(f"sudo {wg_path} show {interface} 2>/dev/null")
-
-    # Parse peer count
+    wg_show = _wg_show()
     peer_count = wg_show.count("peer:")
 
     # Get VPN IP
@@ -118,13 +182,15 @@ def wire_status():
 
 def wire_peers():
     """List connected peers"""
-    is_macos = sys.platform == "darwin"
-    interface = "utun9" if is_macos else "wire0"
-    wg_path = "/opt/homebrew/bin/wg" if is_macos else "wg"
+    interface = _find_wire_interface()
+    if not interface:
+        return {"error": "Wire VPN is not running",
+                "hint": "Check /var/run/wireguard/ or run: sudo wg show interfaces"}
 
-    output = run_cmd(f"sudo {wg_path} show {interface} dump 2>/dev/null")
-    if not output.strip() or "Unable" in output:
-        return {"error": "Wire VPN not running or no peers"}
+    output = _wg_show("dump")
+    if not output.strip() or "Unable" in output or "error" in output.lower():
+        return {"error": f"Wire VPN not responding on interface {interface}",
+                "hint": "Try: sudo wg show " + interface}
 
     peers = []
     lines = output.strip().split("\n")
@@ -177,8 +243,8 @@ def wire_diagnose():
         suggestions.append("Wire VPN requires root privileges. Run with sudo.")
 
     # Check WireGuard installation
-    wg_path = "/opt/homebrew/bin/wg" if is_macos else "wg"
-    wg_check = run_cmd(f"which {wg_path} || which wg")
+    wg_path = _find_wg_bin()
+    wg_check = run_cmd(f"which {wg_path} 2>/dev/null || which wg 2>/dev/null")
     if not wg_check.strip():
         issues.append("WireGuard not installed")
         if is_macos:
@@ -276,14 +342,16 @@ Client Node Setup for {node_name}:
 
 def wire_remove_node(node_name: str, vpn_ip: str = ""):
     """Remove a node from the Wire VPN network"""
-    is_macos = sys.platform == "darwin"
-    interface = "utun9" if is_macos else "wire0"
-    wg_path = "/opt/homebrew/bin/wg" if is_macos else "wg"
+    interface = _find_wire_interface()
+    wg_path  = _find_wg_bin()
+
+    if not interface:
+        return {"error": "Wire VPN is not running — cannot remove node"}
 
     # Get current peers
-    output = run_cmd(f"sudo {wg_path} show {interface} dump 2>/dev/null")
-    if not output.strip():
-        return {"error": "Wire VPN not running"}
+    output = _wg_show("dump")
+    if not output.strip() or "error" in output.lower():
+        return {"error": f"Wire VPN not responding on interface {interface}"}
 
     # Find peer by VPN IP in allowed_ips
     removed = False
@@ -317,12 +385,13 @@ def wire_remove_node(node_name: str, vpn_ip: str = ""):
 def wire_watchdog():
     """Check Wire VPN watchdog/auto-recovery status"""
     is_macos = sys.platform == "darwin"
-    interface = "utun9" if is_macos else "wire0"
-    wg_path = "/opt/homebrew/bin/wg" if is_macos else "wg"
+    interface = _find_wire_interface()
+    wg_path  = _find_wg_bin()
 
     result = {
         "watchdog_enabled": False,
         "service_status": "unknown",
+        "interface": interface,
         "last_handshakes": [],
         "stale_peers": [],
         "recommendations": []
