@@ -342,12 +342,12 @@ class Wire:
                     count += 1
 
             # 2. Add primary relay for NAT node reach
-            # Only if not v1
+            # Only if not relay1
             primary = RELAY_CANDIDATES[0]
             if primary["vpn_ip"] != self.vpn_ip and primary["vpn_ip"] in peer_map:
                 p = peer_map[primary["vpn_ip"]]
                 endpoint = f"{p['public_ip']}:{p['port']}"
-                # Add to v1 for NAT node traffic
+                # Add to relay1 for NAT node traffic
                 self.wg.add_peer(p["wg_public_key"], endpoint, "10.99.0.0/16")
 
             return f"[RELAY] {count} VPS peers"
@@ -399,7 +399,7 @@ class Wire:
                     self.wg.remove_peer(pub_key)
 
         # 2. Add relay candidates directly (VPS only)
-        # NAT nodes route via v1 only
+        # NAT nodes route via relay1 only
         if self.is_relay:  # Only VPS nodes connect to other VPS directly
             peer_map = {p["vpn_ip"]: p for p in peers}
             for candidate in RELAY_CANDIDATES:
