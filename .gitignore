@@ -1,7 +1,49 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Build / packaging
 *.egg-info/
+*.egg
 dist/
 build/
-*.db
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.tar.gz
+*.whl
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+*.lcov
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets / local config
 .env
+*.key
+*.pem
+*.p12

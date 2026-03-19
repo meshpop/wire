@@ -1,6 +1,6 @@
 import os
 #!/usr/bin/env python3
-"""Server Agent - 서버 상태를 대시보드에 보고"""
+"""Server Agent - reports server status to dashboard"""
 import subprocess
 import json
 import socket
@@ -72,7 +72,7 @@ fi""")
 def get_disk():
     result = {"disk_used": "?", "disk_pct": 0, "disk_free": "?"}
     if IS_MACOS:
-        # macOS APFS: /System/Volumes/Data가 실제 데이터 볼륨
+        # macOS APFS: /System/Volumes/Data is the real data volume
         disk = run_cmd("df -h /System/Volumes/Data 2>/dev/null | tail -1 | awk '{print $5, $4, $3, $2}'").split()
         if not disk or len(disk) < 2:
             disk = run_cmd("df -h / | tail -1 | awk '{print $5, $4, $3, $2}'").split()
@@ -149,28 +149,28 @@ def get_services():
     return services
 
 def get_vssh():
-    """vssh 상태 확인"""
+    """Check vssh status"""
     result = {"running": False, "port": 0, "connections": 0, "bind": ""}
 
-    # vssh 프로세스 확인
+    # check vssh process
     vssh_proc = run_cmd("pgrep -fa 'vssh.*server' 2>/dev/null | head -1")
     if vssh_proc:
         result["running"] = True
-        # 포트 추출
+        # extract port
         if "--ssh-port" in vssh_proc:
             try:
                 port = vssh_proc.split("--ssh-port")[1].split()[0]
                 result["port"] = int(port)
             except (ValueError, TypeError) as e:
                 pass  # e silenced
-        # 바인드 주소 추출
+        # extract bind address
         if "--bind" in vssh_proc:
             try:
                 result["bind"] = vssh_proc.split("--bind")[1].split()[0]
             except (ValueError, TypeError) as e:
                 pass  # e silenced
 
-    # 연결 수 확인 (포트로)
+    # check connection count (by port)
     if result["port"]:
         conns = run_cmd(f"ss -tn 2>/dev/null | grep -c ':{result['port']}' || echo 0")
         try:
@@ -196,10 +196,10 @@ def get_firewall():
     return fw.strip() if fw else "unknown"
 
 def get_security():
-    """보안 점검"""
+    """Security check"""
     issues = []
 
-    # 1. SSH 실패 로그인 시도 (최근 1시간)
+    # 1. SSH failed login attempts (last 1 hour)
     if IS_MACOS:
         ssh_fails = run_cmd("log show --predicate 'process == \"sshd\" && eventMessage contains \"Failed\"' --last 1h 2>/dev/null | wc -l").strip()
     else:
@@ -207,62 +207,62 @@ def get_security():
     try:
         ssh_fail_count = int(ssh_fails)
         if ssh_fail_count > 10:
-            issues.append({"level": "warning", "type": "ssh_bruteforce", "msg": f"SSH 실패 {ssh_fail_count}회 (1시간)"})
+            issues.append({"level": "warning", "type": "ssh_bruteforce", "msg": f"SSH failures {ssh_fail_count} (1 hour)"})
         elif ssh_fail_count > 50:
-            issues.append({"level": "critical", "type": "ssh_bruteforce", "msg": f"SSH 공격 의심 {ssh_fail_count}회"})
+            issues.append({"level": "critical", "type": "ssh_bruteforce", "msg": f"SSH attack suspected {ssh_fail_count} attempts"})
     except (ValueError, TypeError) as e:
         pass  # e silenced
 
-    # 2. Root 로그인 활성화 여부
+    # 2. Root login enabled check
     if not IS_MACOS:
         root_login = run_cmd("grep -E '^PermitRootLogin' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}'").strip()
         if root_login in ["yes", "without-password"]:
-            issues.append({"level": "info", "type": "ssh_root", "msg": "Root SSH 허용됨"})
+            issues.append({"level": "info", "type": "ssh_root", "msg": "Root SSH allowed"})
 
-    # 3. 비밀번호 인증 활성화 여부
+    # 3. Password authentication enabled check
     if not IS_MACOS:
         pwd_auth = run_cmd("grep -E '^PasswordAuthentication' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}'").strip()
         if pwd_auth == "yes":
-            issues.append({"level": "info", "type": "ssh_password", "msg": "SSH 비밀번호 인증 허용"})
+            issues.append({"level": "info", "type": "ssh_password", "msg": "SSH password auth allowed"})
 
-    # 4. 위험한 포트 오픈 체크
-    dangerous_ports = {23: "Telnet", 21: "FTP", 3389: "RDP", 5900: "VNC", 6379: "Redis(외부)", 27017: "MongoDB(외부)"}
+    # 4. Dangerous open port check
+    dangerous_ports = {23: "Telnet", 21: "FTP", 3389: "RDP", 5900: "VNC", 6379: "Redis(external)", 27017: "MongoDB(external)"}
     open_ports = get_ports()
     for port, name in dangerous_ports.items():
         if port in open_ports:
-            issues.append({"level": "warning", "type": "dangerous_port", "msg": f"{name} 포트 {port} 오픈"})
+            issues.append({"level": "warning", "type": "dangerous_port", "msg": f"{name} port {port} open"})
 
-    # 5. 디스크 공간 부족
+    # 5. Low disk space
     disk_pct = int(run_cmd("df / | tail -1 | awk '{print $5}' | tr -d '%'") or "0")
     if disk_pct > 90:
-        issues.append({"level": "critical", "type": "disk_full", "msg": f"디스크 {disk_pct}% 사용"})
+        issues.append({"level": "critical", "type": "disk_full", "msg": f"Disk {disk_pct}% used"})
     elif disk_pct > 80:
-        issues.append({"level": "warning", "type": "disk_warning", "msg": f"디스크 {disk_pct}% 사용"})
+        issues.append({"level": "warning", "type": "disk_warning", "msg": f"Disk {disk_pct}% used"})
 
-    # 6. 메모리 부족
+    # 6. Low memory
     mem_info = get_memory()
     if mem_info.get("mem_pct", 0) > 90:
-        issues.append({"level": "warning", "type": "memory_high", "msg": f"메모리 {mem_info['mem_pct']}% 사용"})
+        issues.append({"level": "warning", "type": "memory_high", "msg": f"Memory {mem_info['mem_pct']}% used"})
 
-    # 7. 좀비 프로세스
+    # 7. Zombie processes
     zombie = run_cmd("ps aux | grep -c ' Z ' 2>/dev/null || echo 0").strip()
     try:
         if int(zombie) > 5:
-            issues.append({"level": "warning", "type": "zombie_procs", "msg": f"좀비 프로세스 {zombie}개"})
+            issues.append({"level": "warning", "type": "zombie_procs", "msg": f"Zombie processes: {zombie}"})
     except (ValueError, TypeError) as e:
         pass  # e silenced
 
     return issues
 
 def get_recent_logs():
-    """최근 로그 분석"""
+    """Analyze recent logs"""
     logs = []
 
     if IS_MACOS:
-        # macOS: 최근 에러 로그
+        # macOS: recent error logs
         errors = run_cmd("log show --predicate 'messageType == error' --last 10m 2>/dev/null | tail -5")
     else:
-        # Linux: journalctl에서 에러/경고 추출
+        # Linux: extract errors/warnings from journalctl
         errors = run_cmd("journalctl -p err -n 10 --no-pager 2>/dev/null | tail -5")
 
     if errors:
@@ -270,19 +270,19 @@ def get_recent_logs():
             if line.strip():
                 logs.append({"level": "error", "msg": line.strip()[:100]})
 
-    # OOM Killer 감지
+    # OOM Killer detection
     if not IS_MACOS:
         oom = run_cmd("dmesg 2>/dev/null | grep -i 'out of memory' | tail -1")
         if oom:
-            logs.append({"level": "critical", "msg": "OOM Killer 발생: " + oom[:80]})
+            logs.append({"level": "critical", "msg": "OOM Killer triggered: " + oom[:80]})
 
-    # 서비스 실패 감지
+    # Service failure detection
     if not IS_MACOS:
         failed_svc = run_cmd("systemctl --failed --no-pager 2>/dev/null | grep -E '●|failed' | head -3")
         if failed_svc and "0 loaded" not in failed_svc:
             for line in failed_svc.strip().split('\n'):
                 if line.strip():
-                    logs.append({"level": "warning", "msg": "서비스 실패: " + line.strip()[:60]})
+                    logs.append({"level": "warning", "msg": "Service failed: " + line.strip()[:60]})
 
     return logs
 

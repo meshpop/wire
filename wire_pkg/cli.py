@@ -14,7 +14,7 @@ import urllib.request
 __version__ = "1.1.0"
 
 # ─────────────────────────────────────────────────────────────
-# 설정
+# Config
 # ─────────────────────────────────────────────────────────────
 INTERFACE = "wire0"
 REFRESH_INTERVAL = 30
@@ -24,7 +24,7 @@ WG_GO_PATH = "/opt/homebrew/bin/wireguard-go" if IS_MACOS else "wireguard-go"
 
 
 def run(cmd: str, check=True) -> str:
-    """쉘 명령 실행"""
+    """Run shell command"""
     if IS_MACOS:
         cmd = cmd.replace("wg ", f"{WG_PATH} ").replace("|wg ", f"|{WG_PATH} ")
     r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
@@ -34,7 +34,7 @@ def run(cmd: str, check=True) -> str:
 
 
 def detect_lan_ip() -> str:
-    """LAN IP 감지"""
+    """Detect LAN IP"""
     if IS_MACOS:
         for iface in ["en0", "en1", "en8"]:
             try:
@@ -227,7 +227,7 @@ class VPNClient:
     def refresh_peers(self):
         result = self.api("GET", "/peers")
         peers = result.get("peers", [])
-        relay_udp = result.get("relay_udp", "")  # 릴레이 서버 UDP 주소
+        relay_udp = result.get("relay_udp", "")  # relay server UDP address
         current = self.wg.get_peers()
 
         for peer in peers:
@@ -237,24 +237,24 @@ class VPNClient:
             pub_key = peer["wg_public_key"]
             vpn_ip = peer["vpn_ip"]
 
-            # 기존 핸드쉐이크 확인 (직접 연결 실패 감지)
+            # check existing handshake (detect direct connection failure)
             peer_info = current.get(pub_key, {})
             last_hs = peer_info.get("latest_handshake", 0)
             no_handshake = last_hs == 0 or (time.time() - last_hs > 180)
 
-            # endpoint 결정
+            # determine endpoint
             if self.lan_ip and peer.get("lan_ip") and is_same_subnet(self.lan_ip, peer["lan_ip"]):
-                # 같은 LAN
+                # same LAN
                 endpoint = f"{peer['lan_ip']}:{peer['port']}"
                 mode = "LAN"
             elif no_handshake and pub_key in current and relay_udp:
-                # 직접 연결 실패 → 릴레이 사용
-                # 릴레이 endpoint 설정 (서버의 UDP 포트)
+                # direct connection failed → use relay
+                # set relay endpoint (server UDP port)
                 relay_host = self.server_url.split("//")[1].split(":")[0]
                 endpoint = f"{relay_host}:8787"
                 mode = "RELAY"
             else:
-                # 직접 연결 시도
+                # attempt direct connection
                 endpoint = f"{peer['public_ip']}:{peer['port']}"
                 mode = "DIRECT"
 
@@ -316,7 +316,7 @@ Port:      {self.listen_port}
 # Relay Server with UDP Relay
 # ─────────────────────────────────────────────────────────────
 def run_server(port: int = 8786, udp_port: int = 8787):
-    """릴레이 서버 (HTTP + UDP)"""
+    """Relay server (HTTP + UDP)"""
     from http.server import HTTPServer, BaseHTTPRequestHandler
     import threading
     import struct
@@ -326,7 +326,7 @@ def run_server(port: int = 8786, udp_port: int = 8787):
     lock = threading.Lock()
 
     # ─────────────────────────────────────────
-    # HTTP Server (피어 등록/조회)
+    # HTTP Server (peer registration/lookup)
     # ─────────────────────────────────────────
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
@@ -340,7 +340,7 @@ def run_server(port: int = 8786, udp_port: int = 8787):
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                # 릴레이 서버 정보 추가
+                # add relay server info
                 self.wfile.write(json.dumps({
                     "peers": active,
                     "relay_udp": f"0.0.0.0:{udp_port}"
@@ -370,7 +370,7 @@ def run_server(port: int = 8786, udp_port: int = 8787):
                         "registered": time.time(),
                         "expires": time.time() + 120,
                     }
-                    # UDP 릴레이용 endpoint 매핑
+                    # endpoint mapping for UDP relay
                     endpoints[vpn_ip] = (client_ip, wg_port)
 
                 self.send_response(200)
@@ -383,7 +383,7 @@ def run_server(port: int = 8786, udp_port: int = 8787):
                 }).encode())
 
             elif self.path == "/tunnel":
-                # 릴레이 터널 요청
+                # relay tunnel request
                 # {"from_vpn": "10.99.x.x", "to_vpn": "10.99.y.y"}
                 length = int(self.headers.get("Content-Length", 0))
                 data = json.loads(self.rfile.read(length)) if length else {}
@@ -396,7 +396,7 @@ def run_server(port: int = 8786, udp_port: int = 8787):
                         from_pub, _ = endpoints[from_vpn]
                         to_pub, to_port = endpoints[to_vpn]
 
-                        # 터널 설정: from의 패킷 → to로 전달
+                        # tunnel config: forward from's packets → to
                         tunnels[from_pub] = (to_pub, to_port)
                         print(f"[TUNNEL] {from_vpn} ({from_pub}) -> {to_vpn} ({to_pub}:{to_port})")
 
@@ -419,18 +419,18 @@ def run_server(port: int = 8786, udp_port: int = 8787):
                 self.end_headers()
 
     # ─────────────────────────────────────────
-    # UDP Relay Server (WireGuard 트래픽 중계)
+    # UDP Relay Server (WireGuard traffic relay)
     # ─────────────────────────────────────────
-    # 터널 요청: POST /tunnel {"from_vpn": "10.99.x.x", "to_vpn": "10.99.y.y"}
-    # 서버가 from_vpn의 트래픽을 to_vpn의 실제 endpoint로 전달
+    # Tunnel request: POST /tunnel {"from_vpn": "10.99.x.x", "to_vpn": "10.99.y.y"}
+    # Server forwards from_vpn traffic to to_vpn's real endpoint
     tunnels = {}  # (src_public_ip) -> (dst_public_ip, dst_port)
     reverse_tunnels = {}  # (dst_public_ip, dst_port) -> (src_public_ip, src_port)
 
     def udp_relay():
         """
-        UDP 릴레이:
-        - 등록된 터널에 따라 WireGuard 패킷 양방향 전달
-        - 클라이언트가 /tunnel API로 터널 요청하면 자동 설정
+        UDP relay:
+        - Bidirectional WireGuard packet forwarding per registered tunnels
+        - Auto-configured when client requests tunnel via /tunnel API
         """
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -447,7 +447,7 @@ def run_server(port: int = 8786, udp_port: int = 8787):
                     if src_ip in tunnels:
                         dst_ip, dst_port = tunnels[src_ip]
                         sock.sendto(data, (dst_ip, dst_port))
-                        # 응답 라우팅 설정
+                        # set up response routing
                         reverse_tunnels[(dst_ip, dst_port)] = addr
 
                     # Reverse: dst -> relay -> src
@@ -455,9 +455,9 @@ def run_server(port: int = 8786, udp_port: int = 8787):
                         orig_addr = reverse_tunnels[(src_ip, addr[1])]
                         sock.sendto(data, orig_addr)
 
-                    # 새 연결: 등록된 피어면 자동 터널 생성
+                    # new connection: auto-create tunnel if registered peer
                     else:
-                        # 발신자 VPN IP 찾기
+                        # find sender VPN IP
                         src_vpn = None
                         for vpn, (pub, _) in endpoints.items():
                             if pub == src_ip:
@@ -465,14 +465,14 @@ def run_server(port: int = 8786, udp_port: int = 8787):
                                 break
 
                         if src_vpn:
-                            # 첫 번째로 매칭되는 다른 피어에게 전달 (simple mode)
-                            # 실제로는 /tunnel API로 명시적으로 설정해야 함
+                            # forward to first matching other peer (simple mode)
+                            # in practice, use /tunnel API for explicit setup
                             print(f"[RELAY] New connection from {src_ip} ({src_vpn})")
 
             except Exception as e:
                 print(f"UDP relay error: {e}")
 
-    # HTTP + UDP 서버 동시 실행
+    # Run HTTP + UDP servers concurrently
     udp_thread = threading.Thread(target=udp_relay, daemon=True)
     udp_thread.start()
 
@@ -486,7 +486,7 @@ def run_server(port: int = 8786, udp_port: int = 8787):
 # Service Installer
 # ─────────────────────────────────────────────────────────────
 def install_service(server_url: str, port: int = 51820):
-    """시스템 서비스로 설치"""
+    """Install as system service"""
     if os.geteuid() != 0:
         print("Error: Must run as root (sudo)")
         sys.exit(1)
@@ -550,11 +550,11 @@ WantedBy=multi-user.target
 
 
 def show_status(server_url: str = None):
-    """tailscale status 스타일로 상태 표시"""
+    """Show status in tailscale status style"""
     default_server = os.environ.get("WIRE_SERVER_URL", "")
     srv = server_url or default_server
 
-    # 인터페이스에서 내 VPN IP 가져오기
+    # get my VPN IP from interface
     iface = "utun9" if IS_MACOS else "wire0"
     my_vpn_ip = ""
     r = subprocess.run(["ifconfig" if IS_MACOS else "ip", "addr" if not IS_MACOS else iface],
@@ -564,7 +564,7 @@ def show_status(server_url: str = None):
             my_vpn_ip = line.split()[1].split("/")[0]
             break
 
-    # WireGuard 핸드쉐이크 정보 (sudo 필요)
+    # WireGuard handshake info (requires sudo)
     handshakes = {}
     endpoints = {}
     if os.geteuid() == 0:
@@ -581,7 +581,7 @@ def show_status(server_url: str = None):
         except (subprocess.SubprocessError, OSError) as e:
             pass  # e silenced
 
-    # 서버에서 피어 목록 가져오기
+    # get peer list from server
     try:
         req = urllib.request.Request(f"{srv}/peers")
         with urllib.request.urlopen(req, timeout=3) as resp:
@@ -591,7 +591,7 @@ def show_status(server_url: str = None):
         print(f"# Server unreachable: {srv}")
         return
 
-    # 헤더
+    # header
     my_node = ""
     for p in peers:
         if p.get("vpn_ip") == my_vpn_ip:
@@ -604,7 +604,7 @@ def show_status(server_url: str = None):
         print("# not connected")
     print()
 
-    # 테이블 출력 (tailscale 스타일)
+    # print table (tailscale style)
     for p in peers:
         vpn_ip = p.get("vpn_ip", "")
         pub_ip = p.get("public_ip", "")
@@ -612,12 +612,12 @@ def show_status(server_url: str = None):
         port = p.get("port", "")
         node_id = p.get("node_id", "")[:8]
 
-        # 연결 상태 판단
+        # determine connection state
         hs = handshakes.get(vpn_ip, 0)
         ep = endpoints.get(vpn_ip, "")
 
         if vpn_ip == my_vpn_ip:
-            # 자기 자신
+            # self
             status = "-"
             conn_info = ""
         elif hs:
@@ -626,7 +626,7 @@ def show_status(server_url: str = None):
                 status = "active"
             else:
                 status = "idle"
-            # direct vs relay 판단
+            # determine direct vs relay
             if ep:
                 if lan_ip and lan_ip in ep:
                     conn_info = f"direct {ep} (LAN)"
@@ -638,13 +638,13 @@ def show_status(server_url: str = None):
             status = "offline"
             conn_info = f"via {pub_ip}:{port}"
 
-        # 출력
+        # output
         line = f"{vpn_ip:<16} {node_id:<10} {status:<8}"
         if conn_info:
             line += f" {conn_info}"
         print(line)
 
-    # sudo 없이 실행 시 안내
+    # note when running without sudo
     if os.geteuid() != 0 and not handshakes:
         print()
         print("# run with sudo to see connection status")
