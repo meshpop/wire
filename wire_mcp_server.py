@@ -661,5 +661,21 @@ def main():
             sys.stderr.write(f"Error: {e}\n")
             break
 
+
+def handle_tool(name: str, arguments: dict) -> str:
+    """Unified MCP compatibility wrapper."""
+    resp = handle_request({
+        "method": "tools/call",
+        "id": 1,
+        "params": {"name": name, "arguments": arguments},
+    })
+    if resp and "result" in resp:
+        content = resp["result"].get("content", [])
+        if content:
+            return content[0].get("text", "{}")
+    if resp and "error" in resp:
+        return json.dumps({"error": resp["error"]})
+    return json.dumps({"error": "no result"})
+
 if __name__ == "__main__":
     main()

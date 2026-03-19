@@ -37,5 +37,8 @@ wire-mcp = "wire_mcp_server:main"
 Homepage = "https://github.com/meshpop/wire"
 Repository = "https://github.com/meshpop/wire"
 
+[project.entry-points."meshpop.mcp"]
+wire = "wire_mcp_server"
+
 [tool.setuptools]
 py-modules = ["wire_client", "wire_server", "wire_agent", "wire_mcp_server"]
