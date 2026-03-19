@@ -79,7 +79,7 @@ mpop deploy      push code (uses vssh PUT internally)
 mpop info        node telemetry (GPU, processes, security)
 mpop secret      encrypted credential management
 mpop heal        auto-detect problems and fix
-mpop dragon      cold automated enforcement
+mpop enforce      cold automated enforcement
 mpop ask         natural language → mpop commands
 ```
 
