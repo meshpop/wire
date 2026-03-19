@@ -1,4 +1,4 @@
-# MeshPOP Wire Relay Server
+# Wire Relay Server
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -13,7 +13,6 @@ RUN apt-get update && apt-get install -y \
 # Copy relay server
 COPY server.py .
 COPY client.py .
-COPY meshpop-install.sh .
 
 # Create data directory
 RUN mkdir -p /data
