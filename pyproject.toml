@@ -28,9 +28,9 @@ dependencies = [
 ]
 
 [project.scripts]
-wire = "client:main"
-wire-server = "server:main"
-wire-agent = "agent:main"
+wire = "wire_client:main"
+wire-server = "wire_server:main"
+wire-agent = "wire_agent:main"
 wire-mcp = "wire_mcp_server:main"
 
 [project.urls]
@@ -38,4 +38,4 @@ Homepage = "https://github.com/meshpop/wire"
 Repository = "https://github.com/meshpop/wire"
 
 [tool.setuptools]
-py-modules = ["client", "server", "agent", "wire_mcp_server"]
+py-modules = ["wire_client", "wire_server", "wire_agent", "wire_mcp_server"]

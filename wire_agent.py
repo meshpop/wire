@@ -1,5 +1,5 @@
-import os
 #!/usr/bin/env python3
+import os
 """Server Agent - reports server status to dashboard"""
 import subprocess
 import json

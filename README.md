@@ -47,4 +47,4 @@ Gives AI agents: `wire_status`, `wire_peers`, `wire_connect`, `wire_diagnose`, `
 
 ## License
 
-Apache-2.0
+MIT
