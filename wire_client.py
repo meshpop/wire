@@ -27,7 +27,7 @@ import threading
 import urllib.request
 import urllib.error
 
-VERSION          = "2.0.0"
+VERSION          = "2.1.0"
 INTERFACE        = "wire0"
 REFRESH_INTERVAL = 30       # Heartbeat / peer sync every 30s
 PEER_OFFLINE_TTL = 300      # Seconds before marking peer offline in status display
@@ -289,7 +289,9 @@ def _sync_peers(iface: str, server: str, my_node_id: str):
         port     = p.get("port", 51820)
         if not pub_key or not vpn_ip:
             continue
-        endpoint = f"{pub_ip}:{port}" if pub_ip else ""
+        # Use nat_port if available (NAT-mapped external port from server)
+        effective_port = p.get("nat_port") or port
+        endpoint = f"{pub_ip}:{effective_port}" if pub_ip else ""
         _add_peer(iface, pub_key, vpn_ip, endpoint)
 
     return len(peers)

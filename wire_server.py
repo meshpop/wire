@@ -10,6 +10,7 @@ API:
   GET  /peers           - Get peer list for WireGuard config sync
   GET  /status          - Tailscale-style network status (all nodes, online/offline)
   GET  /health          - Health check
+  GET  /stun            - Return caller external IP:port (for NAT traversal)
   POST /punch           - NAT hole-punch coordination
 """
 
@@ -22,7 +23,7 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 # ── Configuration ────────────────────────────────────────────────────
 PEER_TTL_OFFLINE = 300      # Mark offline after 5 minutes
@@ -133,6 +134,15 @@ class Handler(BaseHTTPRequestHandler):
                 online  = sum(1 for p in peers.values() if peer_status(p) == "online")
             self.send_json({"ok": True, "version": VERSION, "total": total, "online": online})
 
+
+        elif parsed.path == "/stun":
+            """STUN-like: return the exact external IP:port the server sees.
+            Clients use this to know their NAT-mapped IP:port for hole punching."""
+            self.send_json({
+                "ip":   self.client_ip(),
+                "port": self.client_address[1],
+            })
+
         elif parsed.path == "/peers":
             """Return peer list for WireGuard config sync (client daemon uses this)."""
             now = time.time()
@@ -200,6 +210,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             public_ip = self.client_ip()
+            nat_port  = self.client_address[1]
             now       = time.time()
 
             with lock:
@@ -215,6 +226,7 @@ class Handler(BaseHTTPRequestHandler):
                     "wg_public_key": wg_key,
                     "registered":    existing.get("registered", now),
                     "last_seen":     now,
+                "nat_port":      nat_port,
                 }
 
             name_display = node_name or node_id[:12]
@@ -222,9 +234,10 @@ class Handler(BaseHTTPRequestHandler):
             save_state()
 
             self.send_json({
-                "ok":       True,
-                "vpn_ip":   vpn_ip,
-                "your_ip":  public_ip,
+                "ok":        True,
+                "vpn_ip":    vpn_ip,
+                "your_ip":   public_ip,
+                "your_port": nat_port,
             })
 
         elif parsed.path == "/punch":
