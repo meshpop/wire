@@ -285,8 +285,8 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "server_url": {"type": "string", "description": "Coordination server URL (e.g. http://v1.example.com:8787)"},
-                "node_name":  {"type": "string", "description": "Node name (e.g. g1, mypc). Defaults to hostname."},
+                "server_url": {"type": "string", "description": "Coordination server URL (e.g. http://YOUR_SERVER:8787)"},
+                "node_name":  {"type": "string", "description": "Node name (e.g. node1, laptop). Defaults to hostname."},
                 "port":       {"type": "integer", "description": "WireGuard listen port (default 51820)", "default": 51820}
             },
             "required": []

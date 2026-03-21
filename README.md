@@ -1,8 +1,8 @@
 # wire
 
-**wire** is a self-hosted WireGuard mesh VPN — like Tailscale, but you own the server.
+**wire** is a self-hosted WireGuard mesh VPN — like Tailscale, but you own every component.
 
-Any machine (VPS, home server, laptop, cloud instance) installs the same `wire_client.py`. One VPS runs `wire_server.py` as the coordination server. Every node registers with the server, discovers peers, and establishes direct encrypted tunnels — **the coordination server only facilitates introductions; your actual traffic never passes through it**.
+Any machine (VPS, home server, laptop, cloud instance) installs the same `wire_client.py`. One server runs `wire_server.py` as the coordination server. Every node registers with the server, discovers peers, and establishes direct encrypted tunnels — **the coordination server only facilitates introductions; your traffic never passes through it.**
 
 ---
 
@@ -12,288 +12,298 @@ Any machine (VPS, home server, laptop, cloud instance) installs the same `wire_c
 2. [How It Works — Step by Step](#how-it-works)
 3. [VPN IP Assignment](#vpn-ip-assignment)
 4. [NAT Traversal and Hole Punching](#nat-traversal-and-hole-punching)
-5. [Keeping Connections Alive](#keeping-connections-alive)
-6. [Installation](#installation)
-7. [Usage — CLI](#usage--cli)
-8. [Usage — MCP (Claude AI)](#usage--mcp)
-9. [Configuration](#configuration)
-10. [Server API Reference](#server-api-reference)
-11. [File Reference](#file-reference)
+5. [UDP STUN — NAT Port Discovery](#udp-stun)
+6. [Keeping Connections Alive](#keeping-connections-alive)
+7. [Installation](#installation)
+8. [Usage — CLI](#usage--cli)
+9. [Usage — MCP (Claude AI)](#usage--mcp)
+10. [Configuration](#configuration)
+11. [Server API Reference](#server-api-reference)
+12. [File Reference](#file-reference)
+13. [Design Principles](#design-principles)
 
 ---
 
 ## Architecture
 
 ```
-                ┌─────────────────────────────────────┐
-                │  Coordination Server  (one VPS)      │
-                │  wire_server.py  port 8787           │
-                │                                      │
-                │  Knows: who exists, where they are   │
-                │  Does NOT carry traffic              │
-                └──────────┬────────────┬─────────────┘
-                           │            │
-               registers / │            │ registers /
-               heartbeat   │            │ heartbeat
-                           │            │
-              ┌────────────▼──┐      ┌──▼────────────┐
-              │  Node A       │      │  Node B        │
-              │  wire_client  │      │  wire_client   │
-              │  10.99.x.x    │      │  10.99.y.y     │
-              └──────┬────────┘      └────────┬───────┘
-                     │                        │
-                     └──── direct P2P ────────┘
-                          WireGuard tunnel
-                          (end-to-end encrypted)
+                ┌────────────────────────────────────────┐
+                │  Coordination Server  (one always-on)  │
+                │  wire_server.py                        │
+                │  HTTP :8787  —  API                    │
+                │  UDP  :8788  —  STUN (NAT discovery)   │
+                │                                        │
+                │  Knows: who exists, where they are     │
+                │  Does NOT carry VPN traffic            │
+                └──────────┬─────────────┬──────────────┘
+                           │             │
+               registers / │             │ registers /
+               heartbeat   │             │ heartbeat
+                           │             │
+              ┌────────────▼──┐       ┌──▼────────────┐
+              │  Node A       │       │  Node B        │
+              │  wire_client  │       │  wire_client   │
+              │  10.99.x.x    │       │  10.99.y.y     │
+              └──────┬────────┘       └────────┬───────┘
+                     │                         │
+                     └────── direct P2P ───────┘
+                            WireGuard tunnel
+                            end-to-end encrypted
+                            coordination server not involved
 ```
 
 Three files, three roles:
 
 | File | Role | Where it runs |
 |---|---|---|
-| `wire_server.py` | Coordination server | One VPS (always on) |
+| `wire_server.py` | Coordination server + STUN | One always-on server |
 | `wire_client.py` | VPN daemon + CLI | Every node |
-| `wire_mcp_server.py` | MCP interface for Claude | Every machine with Claude Desktop |
+| `wire_mcp_server.py` | MCP interface for Claude | Machines with Claude Desktop |
 
 ---
 
 ## How It Works
 
-Here is the full flow using concrete IP addresses.
+Here is the full flow using generic examples.
 
-**Our example network:**
+**Example network:**
 
 ```
-v1      = VPS, public IP 45.76.100.10    ← runs wire_server.py
-g1      = server, public IP 123.45.67.89  ← no NAT
-macbook = laptop, behind home router,
-          router public IP 211.100.200.50,
-          laptop LAN IP 192.168.0.5        ← behind NAT
-l1      = home server, no public IP,
-          behind router, LAN IP 192.168.1.10 ← behind NAT
+server1 = always-on VPS  (runs wire_server.py, has public IP, no NAT)
+node1   = server or desktop, direct public IP, no NAT
+node2   = laptop, behind home router  (NAT — no direct public IP)
+node3   = home server, behind router  (NAT — no direct public IP)
 ```
 
-### Step 1 — Start the coordination server on v1
+### Step 1 — Start the coordination server
 
 ```bash
-# on v1
+# on server1
+python3 wire_server.py
+# or specify port:
 python3 wire_server.py 8787
 ```
 
-v1 is now the directory service. It knows nothing yet:
-
 ```
-GET http://45.76.100.10:8787/status
-→ { "total": 0, "online": 0, "nodes": [] }
+wire server v2.2.0
+  HTTP :8787  — register / peers / status / health / ip / punch
+  UDP  :8788  — STUN (NAT port discovery)
+```
+
+No nodes registered yet:
+
+```bash
+curl http://SERVER1_IP:8787/status
+# → { "total": 0, "online": 0, "nodes": [] }
 ```
 
 ---
 
-### Step 2 — g1 joins the network
+### Step 2 — node1 joins the network
 
 ```bash
-# on g1
+# on node1
 sudo python3 wire_client.py up \
-  --server http://45.76.100.10:8787 \
-  --name g1
+  --server http://SERVER1_IP:8787 \
+  --name node1
 ```
 
 **What happens internally:**
 
-**① Key generation**
-
-wire generates a WireGuard keypair once and saves it:
+**① Key generation** (once, then reused)
 
 ```
-/etc/wire/private.key  ← never leaves this machine
-/etc/wire/public.key   ← sent to the coordination server
+/etc/wire/private.key   ← never leaves this machine
+/etc/wire/public.key    ← shared with coordination server
 ```
 
-**② VPN IP assignment**
+**② NAT port discovery via UDP STUN**
 
-wire does not use DHCP. Each node's VPN IP is computed deterministically from its node ID (a SHA-256 hash of hostname + MAC address):
+Before WireGuard starts, the client opens a UDP socket on port 51820 and sends a probe to the server's STUN port (8788):
+
+```
+node1 UDP :51820  →  SERVER1_IP:8788
+server sees source: PUBLIC_IP:51820  (no NAT on node1, same port)
+server replies:     {"ip": "PUBLIC_IP", "port": 51820}
+```
+
+The socket closes. WireGuard will use the same port.
+
+**③ VPN IP assignment** (deterministic, no DHCP)
 
 ```python
-h = sha256("g1-AA:BB:CC:DD:EE:FF".encode()).digest()
-vpn_ip = f"10.99.{h[0]}.{h[1]}"   # e.g. 10.99.23.187
+node_id = sha256(hostname + mac_address)[:32]
+vpn_ip  = f"10.99.{hash[0]}.{hash[1]}"   # e.g. 10.99.23.187
 ```
 
-The same machine always gets the same VPN IP. No central allocation, no conflicts (with 65,536 possible addresses in the 10.99.0.0/16 subnet).
+Same machine → same VPN IP, every time. No central allocation needed.
 
-**③ WireGuard interface brought up**
+**④ WireGuard interface brought up**
 
 ```bash
+# Linux
 ip link add wire0 type wireguard
 ip addr add 10.99.23.187/16 dev wire0
 wg setconf wire0 /etc/wireguard/wire0.conf
 ip link set wire0 up
+
+# macOS
+wireguard-go utun9
+wg setconf utun9 ...
+ifconfig utun9 inet 10.99.23.187 ...
 ```
 
-At this point g1 has a VPN interface but no peers yet.
-
-**④ Registration with coordination server**
+**⑤ Registration with coordination server**
 
 ```
-POST http://45.76.100.10:8787/register
+POST SERVER1_IP:8787/register
 {
-  "node_id":       "a1b2c3d4...",
-  "node_name":     "g1",
-  "wg_public_key": "XYZ9876...",
+  "node_id":       "a1b2c3...",
+  "node_name":     "node1",
+  "wg_public_key": "XYZ...",
   "port":          51820,
+  "nat_port":      51820,    ← discovered via UDP STUN
   "lan_ip":        "10.0.0.2"
 }
 ```
 
-The server records:
-- `public_ip = 123.45.67.89` — the IP the HTTP request arrived from
-- `nat_port = 51820` — the source port the server observed
-- `vpn_ip = 10.99.23.187` — assigned from the hash
-- `last_seen = now`
-
-Server response:
+Server records the node and replies:
 ```json
-{
-  "ok":        true,
-  "vpn_ip":    "10.99.23.187",
-  "your_ip":   "123.45.67.89",
-  "your_port": 51820
-}
+{ "ok": true, "vpn_ip": "10.99.23.187", "your_ip": "PUBLIC_IP_OF_NODE1" }
 ```
 
-**⑤ Background daemon starts**
+**⑥ Background daemon starts**
 
-A thread runs silently: every 30 seconds it calls `/register` (heartbeat) and `/peers` (sync new peers into WireGuard). If g1 goes offline, the server marks it offline after 5 minutes.
+A thread runs silently: every 30 seconds it heartbeats `/register` and syncs peers from `/peers` into WireGuard.
 
 ---
 
-### Step 3 — macbook joins the network
+### Step 3 — node2 joins (behind NAT)
 
 ```bash
-# on macbook
+# on node2 (laptop behind home router)
 sudo python3 wire_client.py up \
-  --server http://45.76.100.10:8787 \
-  --name macbook
+  --server http://SERVER1_IP:8787 \
+  --name node2
 ```
 
-macbook is behind a NAT router. It does not know its own public IP or what port the router assigned to its WireGuard traffic. But the coordination server does.
+node2 is behind NAT. Its internal address is `192.168.x.x`. It does not know its public IP or what port its router assigned to its WireGuard traffic.
 
-When macbook POSTs to `/register`, v1 observes:
-```
-public_ip = 211.100.200.50   ← router's public IP
-nat_port  = 54321            ← port the router's NAT table assigned
-```
+**UDP STUN probe from node2:**
 
-The server returns this to macbook:
-```json
-{
-  "your_ip":   "211.100.200.50",
-  "your_port": 54321
-}
+```
+node2 UDP :51820  →  SERVER1_IP:8788
+
+node2's router NAT table:
+  internal 192.168.x.x:51820  →  external ROUTER_IP:54321
+
+server sees source: ROUTER_IP:54321
+server replies:     {"ip": "ROUTER_IP", "port": 54321}
 ```
 
-macbook saves `nat_port = 54321` and includes it in subsequent heartbeats, so the server can store it in the peer record.
+node2 now knows its real external UDP endpoint: `ROUTER_IP:54321`.
+
+node2 sends `/register` with `nat_port: 54321`. The coordination server stores this.
 
 ---
 
-### Step 4 — g1 and macbook discover each other
+### Step 4 — node1 and node2 discover each other
 
-g1's daemon calls `GET /peers` and receives:
+node1's daemon calls `/peers` and receives node2's entry:
 
 ```json
 {
-  "peers": [
-    {
-      "node_name":     "macbook",
-      "vpn_ip":        "10.99.45.22",
-      "public_ip":     "211.100.200.50",
-      "nat_port":      54321,
-      "wg_public_key": "PQR1234..."
-    }
-  ]
+  "node_name":     "node2",
+  "vpn_ip":        "10.99.45.22",
+  "public_ip":     "ROUTER_IP",
+  "nat_port":      54321,
+  "wg_public_key": "PQR..."
 }
 ```
 
-g1 applies this to its WireGuard interface:
-
+node1 applies this to WireGuard:
 ```bash
 wg set wire0 \
-  peer PQR1234... \
+  peer PQR... \
   allowed-ips 10.99.45.22/32 \
-  endpoint 211.100.200.50:54321 \
+  endpoint ROUTER_IP:54321 \
   persistent-keepalive 25
 ```
 
-macbook does the same and gets g1's entry:
-
-```bash
-wg set utun9 \
-  peer XYZ9876... \
-  allowed-ips 10.99.23.187/32 \
-  endpoint 123.45.67.89:51820 \
-  persistent-keepalive 25
-```
-
-Both sides now know where to send packets.
+node2 does the same for node1. Both WireGuard instances now have each other as peers with correct endpoints.
 
 ---
 
 ## NAT Traversal and Hole Punching
 
-Most nodes in the real world are behind NAT. A home router or cloud firewall will block incoming UDP unless it has already seen outbound traffic to that remote IP:port.
-
-**The hole punching process:**
+When two nodes are both behind NAT, neither can receive incoming connections by default. WireGuard + PersistentKeepalive solves this:
 
 ```
-g1      sends UDP → 211.100.200.50:54321   (macbook's router)
-macbook sends UDP → 123.45.67.89:51820     (g1)
+node1  →  UDP  →  node2's router (ROUTER2_IP:54321)
+node2  →  UDP  →  node1's router (ROUTER1_IP:44321)
 
-macbook's router NAT table already has:
-    internal 192.168.0.5:51820  ←→  external 211.100.200.50:54321
+node1's router NAT table entry: allow traffic from ROUTER2_IP:54321
+node2's router NAT table entry: allow traffic from ROUTER1_IP:44321
 
-When g1's packet arrives at 211.100.200.50:54321,
-the router sees the table entry and forwards it to 192.168.0.5:51820.
+Both packets arrive. Tunnel established.
 ```
 
-The hole is punched. WireGuard takes over from here — all subsequent traffic is encrypted with each node's public key, and only the intended peer can decrypt it.
+This works for Full Cone, Restricted Cone, and Port-Restricted Cone NAT — which covers the vast majority of home routers. Symmetric NAT (rare, mostly corporate firewalls) requires the relay fallback (`/punch` → `use_relay: true`).
 
-**Why this works without a relay:**
+**The coordination server's role ends here.** It provided the addresses. It carries no VPN traffic.
 
-1. Both nodes independently registered their public IP:port with the coordination server.
-2. Both nodes retrieved each other's public IP:port from `/peers`.
-3. Both nodes set each other as a WireGuard `endpoint`.
-4. WireGuard sends the first packet. The NAT table entry exists because the node initiated the outbound connection when it first connected.
-5. `PersistentKeepalive = 25` ensures a packet is sent every 25 seconds, keeping the NAT entry alive indefinitely.
+---
 
-The coordination server's only role was to exchange addresses. **Actual traffic flows directly between nodes** — the coordination server carries zero bytes of VPN traffic.
+## UDP STUN
+
+Standard STUN servers (e.g. Google's `stun.l.google.com`) are external services. wire has no external dependencies — the coordination server itself provides STUN over UDP.
+
+```
+Client: UDP socket bound to WireGuard port (51820)
+        → sends probe to SERVER:8788
+Server: observes source IP:port after NAT translation
+        → responds with {"ip": "...", "port": ...}
+Client: closes socket, WireGuard binds to same port
+```
+
+The UDP port (8788) is always `HTTP_PORT + 1`. Configurable via `WIRE_PORT` environment variable.
+
+**Why UDP, not TCP:**
+
+NAT routers maintain separate mapping tables for TCP and UDP. A TCP connection to port 8787 reveals the TCP NAT mapping. WireGuard uses UDP. The only way to see the UDP NAT mapping for port 51820 is to send a UDP packet from port 51820 and observe what the server receives.
 
 ---
 
 ## Keeping Connections Alive
 
-WireGuard's `PersistentKeepalive = 25` sends a small keepalive packet every 25 seconds:
+```
+PersistentKeepalive = 25
+```
 
-- Prevents the NAT router from expiring the table entry (most routers expire UDP after 30–120 seconds of silence)
-- Automatically re-establishes the connection after an IP change (e.g. laptop moves from home wifi to mobile data — next keepalive re-punches the hole)
-- No user intervention required after initial setup
+Every peer gets this setting. A keepalive packet is sent every 25 seconds.
+
+- Prevents NAT routers from expiring the UDP mapping (most expire after 30–120s of silence)
+- Re-establishes the connection after an IP change (laptop switches from WiFi to mobile — next keepalive re-opens the path)
+- No user action needed after initial setup
 
 ---
 
 ## Installation
 
-### Coordination server (one VPS)
+### Coordination server
 
 ```bash
-# Install Python 3 (already present on most Linux systems)
-python3 --version
+# Copy wire_server.py to your always-on server
+scp wire_server.py user@YOUR_SERVER:/opt/wire/
 
-# Copy wire_server.py to the server
-scp wire_server.py root@45.76.100.10:/opt/wire/
+# Run
+python3 /opt/wire/wire_server.py
 
-# Run (or add to systemd — see below)
+# Or with a custom port
 python3 /opt/wire/wire_server.py 8787
 ```
 
-**Systemd service (recommended):**
+**Systemd service (recommended for always-on servers):**
 
 ```ini
 [Unit]
@@ -301,9 +311,10 @@ Description=wire coordination server
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/python3 /opt/wire/wire_server.py 8787
+ExecStart=/usr/bin/python3 /opt/wire/wire_server.py
 Restart=always
 RestartSec=5
+Environment=WIRE_STATE_FILE=/etc/wire/state.json
 
 [Install]
 WantedBy=multi-user.target
@@ -315,20 +326,21 @@ systemctl enable --now wire-server
 
 ### WireGuard tools (every node)
 
-**Linux (Debian/Ubuntu):**
 ```bash
+# Debian / Ubuntu
 apt install wireguard wireguard-tools
-```
 
-**Linux (RHEL/Fedora/CentOS):**
-```bash
+# RHEL / Fedora / CentOS
 dnf install wireguard-tools
-```
 
-**macOS:**
-```bash
+# Alpine
+apk add wireguard-tools
+
+# macOS
 brew install wireguard-tools wireguard-go
 ```
+
+Run `wire install` to check your platform and get the right command.
 
 ---
 
@@ -336,23 +348,23 @@ brew install wireguard-tools wireguard-go
 
 ### `wire up` — join the network
 
+First time (server URL and name required):
 ```bash
-sudo wire up --server http://45.76.100.10:8787 --name mynode
+sudo wire up --server http://YOUR_SERVER:8787 --name NODENAME
 ```
 
-After the first run, the server URL and node name are saved to config. Subsequent runs need no arguments:
-
+After first run the config is saved. Subsequent starts need no arguments:
 ```bash
 sudo wire up
 ```
 
 Options:
 
-| Flag | Description | Default |
+| Flag | Default | Description |
 |---|---|---|
-| `--server` / `-s` | Coordination server URL | saved config |
-| `--name` / `-n` | This node's name | hostname |
-| `--port` / `-p` | WireGuard listen port | 51820 |
+| `--server` / `-s` | saved config | Coordination server URL |
+| `--name` / `-n` | hostname | This node's name |
+| `--port` / `-p` | `51820` | WireGuard listen port |
 
 ---
 
@@ -362,43 +374,38 @@ Options:
 wire status
 ```
 
-Output (like `tailscale status`):
-
+Output:
 ```
-wire status  http://45.76.100.10:8787
-  4 online / 1 offline / 5 total
+wire status  http://YOUR_SERVER:8787
+  3 online / 1 offline / 4 total
 
-  ● g1              10.99.23.187     123.45.67.89          5s ago
-  ● macbook         10.99.45.22      211.100.200.50        12s ago
-  ● l1              10.99.87.3       192.168.1.10 (LAN)    8s ago
-  ● v1              10.99.1.1        45.76.100.10          2s ago  (this node)
-  ○ oldserver       10.99.200.5      203.0.113.10          14m ago
+  ● node1          10.99.23.187     203.0.113.10          5s ago
+  ● node2          10.99.45.22      198.51.100.20         12s ago  (this node)
+  ● node3          10.99.87.3       192.0.2.30            8s ago
+  ○ node4          10.99.200.5      203.0.113.40          14m ago
 ```
 
-`●` = online (heartbeat within 5 minutes)
-`○` = offline (no heartbeat for 5+ minutes, kept in list for 24 hours)
+`●` online — heartbeat within 5 minutes  
+`○` offline — no heartbeat for 5+ minutes, kept in list for 24 hours
 
-Use `--json` for machine-readable output:
 ```bash
-wire status --json
+wire status --json   # machine-readable output
 ```
 
 ---
 
-### `wire peers` — list registered peers
+### `wire peers` — list all registered nodes
 
 ```bash
 wire peers
 ```
-
-Shows all nodes currently registered on the coordination server.
 
 ---
 
 ### `wire ping` — ping a peer by name
 
 ```bash
-wire ping g1
+wire ping node1
 wire ping 10.99.23.187
 ```
 
@@ -412,7 +419,7 @@ Resolves node names to VPN IPs via the coordination server, then pings.
 sudo wire down
 ```
 
-Removes the WireGuard interface and stops the daemon. The node will be marked offline on the coordination server after 5 minutes.
+Removes the WireGuard interface and stops the daemon. The node will appear offline after 5 minutes.
 
 ---
 
@@ -422,28 +429,13 @@ Removes the WireGuard interface and stops the daemon. The node will be marked of
 wire install
 ```
 
-Checks if WireGuard tools are installed and prints platform-specific install instructions if not.
+Checks if WireGuard tools are present and prints platform-specific install instructions if not.
 
 ---
 
 ## Usage — MCP
 
-wire integrates with Claude AI via the Model Context Protocol. After adding `wire_mcp_server.py` to your Claude Desktop config, Claude can manage your VPN directly.
-
-**Available tools:**
-
-| Tool | What it does |
-|---|---|
-| `wire_status` | Show full network status — all nodes, online/offline, VPN IPs |
-| `wire_up` | Bring up VPN tunnel |
-| `wire_down` | Tear down VPN tunnel |
-| `wire_peers` | List all registered peers |
-| `wire_ping` | Ping a peer by name or VPN IP |
-| `wire_install` | Check WireGuard installation |
-| `wire_diagnose` | Full diagnostic: WG installed? server reachable? interface up? |
-| `wire_watchdog` | Check peer handshakes, stale connections, service status |
-
-**Claude Desktop config** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+Add `wire_mcp_server.py` to your Claude Desktop config:
 
 ```json
 {
@@ -456,7 +448,20 @@ wire integrates with Claude AI via the Model Context Protocol. After adding `wir
 }
 ```
 
-The MCP server imports its logic from `wire_client.py`. CLI and MCP call the **same core functions** — `cmd_status`, `cmd_up`, `cmd_down`, `cmd_peers`, `cmd_ping` — so behavior is always identical between the two interfaces.
+**Available tools:**
+
+| Tool | What it does |
+|---|---|
+| `wire_status` | Full network view — all nodes, online/offline, VPN IPs |
+| `wire_up` | Bring up VPN tunnel |
+| `wire_down` | Tear down VPN tunnel |
+| `wire_peers` | List all registered peers |
+| `wire_ping` | Ping a peer by name or VPN IP |
+| `wire_install` | Check WireGuard installation |
+| `wire_diagnose` | Full diagnostic: WG installed? server reachable? interface up? |
+| `wire_watchdog` | Peer handshakes, stale connections, service status |
+
+The MCP server imports all logic from `wire_client.py`. CLI and MCP call the **same core functions** — behavior is always identical between the two interfaces.
 
 ---
 
@@ -469,78 +474,78 @@ Config file locations:
 | Root / system daemon | `/etc/wire/config.json` |
 | Regular user | `~/.wire/config.json` |
 
-Example config (written automatically by `wire up`):
+Written automatically by `wire up`. Example:
 
 ```json
 {
-  "server_url":   "http://45.76.100.10:8787",
-  "node_name":    "macbook",
+  "server_url":   "http://YOUR_SERVER:8787",
+  "node_name":    "NODENAME",
   "node_id":      "a1b2c3d4e5f6...",
-  "vpn_ip":       "10.99.45.22",
+  "vpn_ip":       "10.99.x.x",
   "listen_port":  51820,
   "nat_port":     54321
 }
 ```
 
-Environment variables (override config):
+Environment variables (server-side):
 
-| Variable | Description |
-|---|---|
-| `WIRE_VPN_SUBNET` | VPN subnet prefix (default: `10.99`) |
-| `WIRE_STATE_FILE` | Server state file path (default: `/etc/wire/state.json`) |
-| `WIRE_PORT` | Server listen port (default: `8787`) |
+| Variable | Default | Description |
+|---|---|---|
+| `WIRE_PORT` | `8787` | HTTP listen port (UDP STUN = this + 1) |
+| `WIRE_VPN_SUBNET` | `10.99` | VPN IP prefix |
+| `WIRE_STATE_FILE` | `/etc/wire/state.json` | Peer state persistence path |
 
 ---
 
 ## Server API Reference
 
-All endpoints return JSON.
+All HTTP endpoints return JSON.
 
 ### `POST /register`
 
 Node heartbeat. Call every 30 seconds to stay online.
 
-Request:
+Request body:
 ```json
 {
-  "node_id":       "string  (SHA-256 hash of hostname+MAC)",
-  "node_name":     "string  (human-readable name, e.g. g1)",
+  "node_id":       "string  (SHA-256 of hostname+MAC, 32 hex chars)",
+  "node_name":     "string  (human name, e.g. myserver)",
   "wg_public_key": "string  (WireGuard public key, base64)",
   "port":          51820,
+  "nat_port":      54321,
   "lan_ip":        "192.168.x.x  (optional)"
 }
 ```
 
+`nat_port` is the WireGuard UDP port as seen from outside NAT, discovered via UDP STUN before calling this endpoint. If the node has no NAT, `nat_port` equals `port`.
+
 Response:
 ```json
 {
-  "ok":        true,
-  "vpn_ip":    "10.99.x.x",
-  "your_ip":   "1.2.3.4",
-  "your_port": 54321
+  "ok":      true,
+  "vpn_ip":  "10.99.x.x",
+  "your_ip": "1.2.3.4"
 }
 ```
-
-`your_ip` and `your_port` are the external IP and port the server observed — the NAT-mapped values, not what the client thinks it has.
 
 ---
 
 ### `GET /status`
 
-Returns all nodes (online and offline). Used by `wire status`.
+All nodes (online and offline). Used by `wire status`.
 
 Response:
 ```json
 {
-  "version": "2.1.0",
-  "total":   5,
-  "online":  4,
+  "version": "2.2.0",
+  "total":   4,
+  "online":  3,
   "offline": 1,
   "nodes": [
     {
-      "node_name":     "g1",
+      "node_name":     "node1",
       "vpn_ip":        "10.99.23.187",
-      "public_ip":     "123.45.67.89",
+      "public_ip":     "203.0.113.10",
       "nat_port":      51820,
       "status":        "online",
       "last_seen_ago": 5
@@ -553,53 +558,52 @@ Response:
 
 ### `GET /peers`
 
-Returns only **online** nodes. Used by the client daemon for WireGuard peer sync.
+Online nodes only. Used by the client daemon for WireGuard peer sync every 30 seconds.
 
 ---
 
-### `GET /stun`
+### `GET /ip`
 
-Returns the caller's external IP and port as observed by the server. Used after `/register` to discover NAT-mapped port.
+Returns the caller's public IP (TCP). Quick check only — not for WireGuard port discovery (use UDP STUN for that).
 
-Response:
 ```json
-{
-  "ip":   "211.100.200.50",
-  "port": 54321
-}
+{ "ip": "1.2.3.4" }
 ```
 
 ---
 
 ### `GET /health`
 
-Simple health check.
-
-Response:
 ```json
-{
-  "ok":      true,
-  "version": "2.1.0",
-  "total":   5,
-  "online":  4
-}
+{ "ok": true, "version": "2.2.0", "total": 4, "online": 3 }
 ```
 
 ---
 
 ### `POST /punch`
 
-NAT hole-punch coordination. Called when a direct connection attempt fails.
+NAT hole-punch coordination. Called when a direct connection attempt fails. After 3 attempts the server sets `use_relay: true`, signaling that a relay path should be used.
 
 Request:
 ```json
-{
-  "from_vpn_ip": "10.99.45.22",
-  "to_vpn_ip":   "10.99.23.187"
-}
+{ "from_vpn_ip": "10.99.x.x", "to_vpn_ip": "10.99.y.y" }
 ```
 
-Response includes `use_relay: true` after 3 failed attempts, signaling that a relay path should be used as fallback.
+Response:
+```json
+{ "ok": true, "use_relay": false, "attempts": 1 }
+```
+
+---
+
+### UDP STUN — port `HTTP_PORT + 1`
+
+Send any UDP packet from your WireGuard port. Receive the NAT-mapped external IP:port.
+
+```
+Client → UDP packet (from port 51820) → SERVER:8788
+Server → {"ip": "EXTERNAL_IP", "port": EXTERNAL_PORT}
+```
 
 ---
 
@@ -607,32 +611,33 @@ Response includes `use_relay: true` after 3 failed attempts, signaling that a re
 
 ```
 wire/
-├── wire_server.py       Coordination server — run on one VPS
+├── wire_server.py       Coordination server + UDP STUN — run on one always-on server
 ├── wire_client.py       VPN daemon + CLI — run on every node
 │                          Exports: cmd_status, cmd_up, cmd_down,
 │                                   cmd_peers, cmd_ping, cmd_install
 ├── wire_mcp_server.py   MCP wrapper for Claude AI
 │                          Imports core functions from wire_client.py
-│                          No duplicate logic
 └── wire_agent.py        (optional) agent utilities
 
-/etc/wire/
-├── config.json          Node config (written by wire up)
+/etc/wire/               (root) or ~/.wire/ (user)
+├── config.json          Node config — written by wire up
 ├── private.key          WireGuard private key (chmod 600)
 ├── public.key           WireGuard public key
-└── state.json           Server peer state (written by wire_server.py)
+└── state.json           Server peer state — written by wire_server.py
 ```
 
 ---
 
 ## Design Principles
 
-**No central bottleneck.** The coordination server handles only small JSON messages (registration, peer lists). Your VPN traffic never touches it.
+**No hardcoded values.** No IP addresses, hostnames, or node names in the code. Everything comes from config files or CLI arguments.
 
-**Deterministic IPs.** VPN IPs are derived from a hash of the machine's identity. No DHCP, no race conditions, no manual assignment.
+**No external dependencies.** No Google STUN servers, no relay services, no cloud providers. The coordination server you run handles everything including NAT port discovery.
 
-**Same logic everywhere.** `wire_client.py` exports the same functions used by both the CLI (`wire status`) and the MCP server (`wire_status` tool). They always behave identically.
+**No central bottleneck.** The coordination server handles only small JSON messages. VPN traffic flows directly between nodes.
+
+**Deterministic VPN IPs.** Derived from each machine's own identity hash. No DHCP, no manual assignment, no conflicts.
+
+**Same logic everywhere.** `wire_client.py` exports the same functions used by both the CLI and the MCP server. They always behave identically.
 
 **Offline tolerance.** Nodes keep their WireGuard peers configured even when the coordination server is unreachable. Established tunnels survive server restarts.
-
-**NAT-transparent.** The `/stun` endpoint and `PersistentKeepalive = 25` together handle NAT traversal without any external STUN servers. The coordination server itself provides the NAT discovery service.

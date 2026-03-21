@@ -20,6 +20,7 @@ import json
 import os
 import signal
 import socket
+import socket as _socket
 import subprocess
 import sys
 import time
@@ -27,7 +28,7 @@ import threading
 import urllib.request
 import urllib.error
 
-VERSION          = "2.1.0"
+VERSION          = "2.2.0"
 INTERFACE        = "wire0"
 REFRESH_INTERVAL = 30       # Heartbeat / peer sync every 30s
 PEER_OFFLINE_TTL = 300      # Seconds before marking peer offline in status display
@@ -141,7 +142,61 @@ def detect_lan_ip() -> str:
             return ip
     except OSError:
         pass
+
     return ""
+
+
+# ── UDP STUN — NAT port discovery ─────────────────────────────────────
+
+def discover_nat_port(server_host: str, stun_port: int,
+                      wg_port: int = WG_LISTEN_PORT, timeout: float = 3.0) -> tuple:
+    """
+    Discover the external (NAT-mapped) IP and port for our WireGuard UDP port.
+
+    How it works:
+      1. Open a UDP socket bound to wg_port (same port WireGuard will use).
+      2. Send a probe packet to the wire server's UDP STUN port.
+      3. The server sees the source IP:port after NAT translation and replies.
+      4. Close the socket — WireGuard will then bind to the same port.
+
+    For most NAT types (Full Cone, Restricted Cone, Port-Restricted Cone):
+      the NAT mapping for port wg_port stays consistent, so WireGuard
+      will get the same external port as the probe.
+
+    For Symmetric NAT (per-destination port mapping):
+      the probe gives the mapping for the server destination.
+      Other peers may see a different external port from the server.
+      In that case /punch + relay fallback handles it.
+
+    Returns: (external_ip: str, external_port: int)
+      On failure returns ("", wg_port) — caller uses wg_port as best guess.
+    """
+    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("0.0.0.0", wg_port))
+        sock.settimeout(timeout)
+        # Send a small probe; content does not matter
+        sock.sendto(b"wire-stun-probe", (server_host, stun_port))
+        data, _ = sock.recvfrom(256)
+        result  = json.loads(data)
+        return result.get("ip", ""), int(result.get("port", wg_port))
+    except OSError as e:
+        # Port already in use — WireGuard may already be running
+        _log(f"[stun] bind :{wg_port} failed ({e}) — using port as-is")
+        return "", wg_port
+    except Exception as e:
+        _log(f"[stun] probe failed ({e}) — using port as-is")
+        return "", wg_port
+    finally:
+        sock.close()
+
+
+def _log(msg: str):
+    """Simple stderr logger (does not interfere with MCP stdout)."""
+    import sys as _sys
+    _sys.stderr.write(msg + "\n")
+    _sys.stderr.flush()
 
 
 # ── HTTP helpers ──────────────────────────────────────────────────────
@@ -412,6 +467,20 @@ def cmd_up(name: str = None, server: str = None, port: int = WG_LISTEN_PORT,
     # Keys
     priv, pub = _load_or_create_keys(config_dir)
 
+    # Discover NAT-mapped external UDP port BEFORE WireGuard takes the socket.
+    # Parse server host from URL (e.g. "http://45.76.100.10:8787" → "45.76.100.10")
+    import urllib.parse as _up
+    _parsed      = _up.urlparse(server)
+    _server_host = _parsed.hostname or server.split("//")[-1].split(":")[0]
+    _stun_port   = (_parsed.port or 8787) + 1  # UDP STUN = HTTP port + 1
+
+    ext_ip, nat_port = discover_nat_port(_server_host, _stun_port, port)
+    if ext_ip:
+        _log(f"[stun] external UDP: {ext_ip}:{nat_port}")
+    else:
+        _log(f"[stun] could not discover NAT port, using {port}")
+        nat_port = port
+
     # Bring up interface
     actual_iface = _setup_interface(INTERFACE, vpn_ip, port, priv)
 
@@ -420,6 +489,7 @@ def cmd_up(name: str = None, server: str = None, port: int = WG_LISTEN_PORT,
         "node_id":       node_id,
         "node_name":     node_name,
         "port":          port,
+        "nat_port":      nat_port,
         "wg_public_key": pub,
         "lan_ip":        lan_ip,
     })
@@ -430,7 +500,7 @@ def cmd_up(name: str = None, server: str = None, port: int = WG_LISTEN_PORT,
     peer_count = _sync_peers(actual_iface, server, node_id)
 
     # Start daemon thread
-    _start_daemon(actual_iface, server, node_id, node_name, pub, port)
+    _start_daemon(actual_iface, server, node_id, node_name, pub, port, nat_port)
 
     result = {
         "ok":         True,
@@ -536,15 +606,17 @@ _daemon_stop   = threading.Event()
 
 
 def _daemon_loop(iface: str, server: str, node_id: str, node_name: str,
-                 pub_key: str, listen_port: int):
+                 pub_key: str, listen_port: int, nat_port: int = 0):
     """Background thread: heartbeat + peer sync every REFRESH_INTERVAL seconds."""
-    lan_ip = detect_lan_ip()
+    lan_ip   = detect_lan_ip()
+    nat_port = nat_port or listen_port
     while not _daemon_stop.is_set():
         try:
             api_post(server, "/register", {
                 "node_id":       node_id,
                 "node_name":     node_name,
                 "port":          listen_port,
+                "nat_port":      nat_port,
                 "wg_public_key": pub_key,
                 "lan_ip":        lan_ip,
             })
@@ -555,12 +627,12 @@ def _daemon_loop(iface: str, server: str, node_id: str, node_name: str,
 
 
 def _start_daemon(iface: str, server: str, node_id: str, node_name: str,
-                  pub_key: str, listen_port: int):
+                  pub_key: str, listen_port: int, nat_port: int = 0):
     global _daemon_thread, _daemon_stop
     _daemon_stop.clear()
     _daemon_thread = threading.Thread(
         target=_daemon_loop,
-        args=(iface, server, node_id, node_name, pub_key, listen_port),
+        args=(iface, server, node_id, node_name, pub_key, listen_port, nat_port),
         daemon=True,
         name="wire-daemon",
     )
@@ -580,7 +652,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  wire up --server http://10.0.0.1:8787 --name mynode\n"
+            "  wire up --server http://YOUR_SERVER:8787 --name mynode\n"
             "  wire status\n"
             "  wire peers\n"
             "  wire ping g1\n"
