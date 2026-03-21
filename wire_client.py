@@ -75,7 +75,7 @@ def load_config() -> dict:
         try:
             with open(p) as f:
                 return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
+        except (FileNotFoundError, json.JSONDecodeError, PermissionError):
             continue
     return {}
 
