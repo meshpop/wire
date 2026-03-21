@@ -231,12 +231,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"error": "node_id and wg_public_key required"}, 400)
                 return
 
+            # Optional: client can request a specific vpn_ip (e.g. to fix mis-registered IP)
+            requested_vpn_ip = body.get("vpn_ip", "").strip()
+
             public_ip = self.client_ip()
             now       = time.time()
 
             with lock:
                 existing = peers.get(node_id, {})
-                vpn_ip   = existing.get("vpn_ip") or generate_vpn_ip(node_id)
+                # Priority: client-requested > existing > auto-generated
+                vpn_ip   = requested_vpn_ip or existing.get("vpn_ip") or generate_vpn_ip(node_id)
                 peers[node_id] = {
                     "node_id":       node_id,
                     "node_name":     node_name or existing.get("node_name", ""),

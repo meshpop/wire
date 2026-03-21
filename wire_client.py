@@ -547,7 +547,7 @@ def cmd_up(name: str = None, server: str = None, port: int = WG_LISTEN_PORT,
     # Bring up interface
     actual_iface = _setup_interface(INTERFACE, vpn_ip, port, priv)
 
-    # Register with server
+    # Register with server (include vpn_ip so server honors our configured IP)
     reg = api_post(server, "/register", {
         "node_id":       node_id,
         "node_name":     node_name,
@@ -555,6 +555,7 @@ def cmd_up(name: str = None, server: str = None, port: int = WG_LISTEN_PORT,
         "nat_port":      nat_port,
         "wg_public_key": pub,
         "lan_ip":        lan_ip,
+        "vpn_ip":        vpn_ip,   # let server use our configured IP
     })
     if reg.get("error"):
         return {"ok": False, "error": f"Registration failed: {reg['error']}"}
@@ -563,7 +564,7 @@ def cmd_up(name: str = None, server: str = None, port: int = WG_LISTEN_PORT,
     peer_count = _sync_peers(actual_iface, server, node_id)
 
     # Start daemon thread
-    _start_daemon(actual_iface, server, node_id, node_name, pub, port, nat_port)
+    _start_daemon(actual_iface, server, node_id, node_name, pub, port, nat_port, vpn_ip)
 
     # Auto-update systemd service file (correct path after pip upgrade)
     if os.geteuid() == 0:
@@ -673,7 +674,7 @@ _daemon_stop   = threading.Event()
 
 
 def _daemon_loop(iface: str, server: str, node_id: str, node_name: str,
-                 pub_key: str, listen_port: int, nat_port: int = 0):
+                 pub_key: str, listen_port: int, nat_port: int = 0, vpn_ip: str = ""):
     """Background thread: heartbeat + peer sync every REFRESH_INTERVAL seconds."""
     lan_ip   = detect_lan_ip()
     nat_port = nat_port or listen_port
@@ -686,6 +687,7 @@ def _daemon_loop(iface: str, server: str, node_id: str, node_name: str,
                 "nat_port":      nat_port,
                 "wg_public_key": pub_key,
                 "lan_ip":        lan_ip,
+                "vpn_ip":        vpn_ip,   # keep our configured IP on heartbeat
             })
             _sync_peers(iface, server, node_id)
         except Exception:
@@ -694,12 +696,12 @@ def _daemon_loop(iface: str, server: str, node_id: str, node_name: str,
 
 
 def _start_daemon(iface: str, server: str, node_id: str, node_name: str,
-                  pub_key: str, listen_port: int, nat_port: int = 0):
+                  pub_key: str, listen_port: int, nat_port: int = 0, vpn_ip: str = ""):
     global _daemon_thread, _daemon_stop
     _daemon_stop.clear()
     _daemon_thread = threading.Thread(
         target=_daemon_loop,
-        args=(iface, server, node_id, node_name, pub_key, listen_port, nat_port),
+        args=(iface, server, node_id, node_name, pub_key, listen_port, nat_port, vpn_ip),
         daemon=True,
         name="wire-daemon",
     )
