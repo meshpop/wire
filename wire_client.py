@@ -433,6 +433,41 @@ def _print_status(data: dict):
     print()
 
 
+
+def _install_systemd_service():
+    """Write/update systemd service file so 'wire up' survives reboots and pip upgrades."""
+    import shutil
+    service_path = "/etc/systemd/system/wire.service"
+    wire_bin = shutil.which("wire") or "/usr/local/bin/wire"
+    service_content = f"""[Unit]
+Description=Wire VPN
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={wire_bin} up
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+"""
+    try:
+        import platform
+        if platform.system() != "Linux":
+            return  # systemd only on Linux
+        os.makedirs("/etc/systemd/system", exist_ok=True)
+        with open(service_path, "w") as f:
+            f.write(service_content)
+        os.system("systemctl daemon-reload 2>/dev/null")
+        os.system("systemctl enable wire 2>/dev/null")
+        _log(f"[systemd] service file updated: {service_path}")
+    except Exception as e:
+        _log(f"[systemd] could not write service file: {e}")
+
 def cmd_up(name: str = None, server: str = None, port: int = WG_LISTEN_PORT,
            config_dir: str = None) -> dict:
     """
@@ -501,6 +536,10 @@ def cmd_up(name: str = None, server: str = None, port: int = WG_LISTEN_PORT,
 
     # Start daemon thread
     _start_daemon(actual_iface, server, node_id, node_name, pub, port, nat_port)
+
+    # Auto-update systemd service file (correct path after pip upgrade)
+    if os.geteuid() == 0:
+        _install_systemd_service()
 
     result = {
         "ok":         True,
