@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-wire client - Autonomous WireGuard mesh VPN
-Run: python3 client.py --server http://YOUR_SERVER:8787
+wire client v2.0.0 - WireGuard mesh VPN
+CLI and daemon — same core functions used by MCP server.
 
-Features:
-  - Direct connection priority (P2P)
-  - Multiple relay fallback
-  - Nodes with direct connectivity can communicate without relay
-  - Auto recovery
+Usage:
+  wire status               - Show network status (queries server)
+  wire up [--name NAME]     - Bring up VPN tunnel
+  wire down                 - Tear down VPN tunnel
+  wire peers                - List peers from server
+  wire ping <target>        - Ping a peer by name or VPN IP
+  wire install              - Install WireGuard tools
+
+Config: /etc/wire/config.json (root) or ~/.wire/config.json (user)
 """
 
 import argparse
@@ -19,24 +23,53 @@ import socket
 import subprocess
 import sys
 import time
+import threading
 import urllib.request
+import urllib.error
 
-INTERFACE = "wire0"
-REFRESH_INTERVAL = 30
-HANDSHAKE_TIMEOUT = 90  # Try relay if no handshake
-RETRY_DIRECT_INTERVAL = 300  # 5min retry direct connection
+VERSION          = "2.0.0"
+INTERFACE        = "wire0"
+REFRESH_INTERVAL = 30       # Heartbeat / peer sync every 30s
+PEER_OFFLINE_TTL = 300      # Seconds before marking peer offline in status display
+WG_LISTEN_PORT   = 51820
 
-# Relay candidates and server URLs loaded from config file
-# Config: /etc/meshpop/wire.json or ~/.config/wire/config.json
-# Format: {"relay_candidates": [...], "server_urls": ["http://host:port", ...]}
 CONFIG_PATHS = [
-    "/etc/meshpop/wire.json",
-    os.path.expanduser("~/.config/wire/config.json"),
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "wire.json"),
+    "/etc/wire/config.json",
+    os.path.expanduser("~/.wire/config.json"),
 ]
 
-def load_wire_config():
-    """Load relay and server config from file"""
+# ── Binary discovery ──────────────────────────────────────────────────
+
+def find_bin(name: str) -> str:
+    """Find a binary — checks Homebrew, /usr/local, /usr/bin, PATH."""
+    candidates = [
+        f"/opt/homebrew/bin/{name}",    # macOS arm64 (Apple Silicon)
+        f"/usr/local/bin/{name}",       # macOS x86 / manual install
+        f"/usr/bin/{name}",             # Linux
+        name,                           # PATH fallback
+    ]
+    for c in candidates:
+        if c == name:
+            # PATH search
+            r = subprocess.run(["which", name], capture_output=True, text=True)
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip()
+        elif os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return name  # last resort — let shell try
+
+
+def _run(cmd: str, check: bool = False, timeout: int = 10) -> tuple:
+    """Run shell command. Returns (stdout, stderr, returncode)."""
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"Command failed: {cmd}\n{r.stderr.strip()}")
+    return r.stdout.strip(), r.stderr.strip(), r.returncode
+
+
+# ── Config ────────────────────────────────────────────────────────────
+
+def load_config() -> dict:
     for p in CONFIG_PATHS:
         try:
             with open(p) as f:
@@ -45,49 +78,60 @@ def load_wire_config():
             continue
     return {}
 
-_config = load_wire_config()
-RELAY_CANDIDATES = _config.get("relay_candidates", [])
-SERVER_URLS = _config.get("server_urls", [])
 
-# macOS WireGuard path (Homebrew)
-WG_PATH = "/opt/homebrew/bin/wg" if sys.platform == "darwin" else "wg"
+def save_config(cfg: dict):
+    path = CONFIG_PATHS[0] if os.geteuid() == 0 else CONFIG_PATHS[1]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.chmod(path, 0o600)
 
 
-def run(cmd: str, check=True) -> str:
-    """Run shell command"""
-    if sys.platform == "darwin":
-        cmd = cmd.replace("wg ", f"{WG_PATH} ")
-        cmd = cmd.replace("|wg ", f"|{WG_PATH} ")
-    r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    if check and r.returncode != 0:
-        raise RuntimeError(f"Command failed: {cmd}\n{r.stderr}")
-    return r.stdout.strip()
+def get_server_url(override: str = None) -> str:
+    if override:
+        return override.rstrip("/")
+    cfg = load_config()
+    url = cfg.get("server_url", "")
+    if not url:
+        print("Error: no server URL. Run: wire up --server http://IP:8787 --name MYNAME")
+        sys.exit(1)
+    return url.rstrip("/")
+
+
+# ── Node identity ─────────────────────────────────────────────────────
+
+def generate_node_id() -> str:
+    hostname = socket.gethostname()
+    try:
+        import uuid
+        mac = uuid.getnode()
+        seed = f"{hostname}-{mac}"
+    except OSError:
+        seed = hostname
+    return hashlib.sha256(seed.encode()).hexdigest()[:32]
+
+
+def generate_vpn_ip(node_id: str) -> str:
+    h = hashlib.sha256(node_id.encode()).digest()
+    return f"10.99.{h[0]}.{h[1]}"
 
 
 def detect_lan_ip() -> str:
-    """Detect LAN IP"""
     if sys.platform == "darwin":
         for iface in ["en0", "en1", "en8"]:
-            try:
-                r = subprocess.run(["ifconfig", iface], capture_output=True, text=True, timeout=2)
-                if r.returncode == 0:
-                    for line in r.stdout.split("\n"):
-                        if "inet " in line and "127.0.0.1" not in line:
-                            parts = line.strip().split()
-                            idx = parts.index("inet") + 1
-                            ip = parts[idx]
-                            if ip.startswith("192.168.") or (ip.startswith("10.") and not ip.startswith("10.99.")):
-                                return ip
-            except (subprocess.SubprocessError, OSError) as e:
-                pass  # e silenced
-    try:
-        r = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=2)
-        if r.returncode == 0:
-            for ip in r.stdout.split():
+            out, _, rc = _run(f"ipconfig getifaddr {iface}", timeout=2)
+            if rc == 0 and out:
+                ip = out.strip()
                 if ip.startswith("192.168.") or (ip.startswith("10.") and not ip.startswith("10.99.")):
                     return ip
-    except (subprocess.SubprocessError, OSError) as e:
-        pass  # e silenced
+    try:
+        out, _, rc = _run("hostname -I", timeout=2)
+        if rc == 0:
+            for ip in out.split():
+                if ip.startswith("192.168.") or (ip.startswith("10.") and not ip.startswith("10.99.")):
+                    return ip
+    except Exception:
+        pass
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -96,468 +140,550 @@ def detect_lan_ip() -> str:
         if not ip.startswith("10.99."):
             return ip
     except OSError:
-        pass  # safe to ignore
+        pass
     return ""
 
 
-def is_same_subnet(ip1: str, ip2: str) -> bool:
-    """Check if same /24 subnet"""
-    if not ip1 or not ip2:
-        return False
+# ── HTTP helpers ──────────────────────────────────────────────────────
+
+def api_get(server: str, path: str, timeout: int = 5) -> dict:
     try:
-        return ip1.rsplit(".", 1)[0] == ip2.rsplit(".", 1)[0]
-    except Exception:
-        return False
+        with urllib.request.urlopen(f"{server}{path}", timeout=timeout) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        return {"error": str(e)}
 
 
-def generate_node_id() -> str:
-    """Generate unique node_id"""
-    hostname = socket.gethostname()
+def api_post(server: str, path: str, data: dict, timeout: int = 5) -> dict:
     try:
-        import uuid
-        mac = uuid.getnode()
-        return hashlib.sha256(f"{hostname}-{mac}".encode()).hexdigest()[:32]
-    except OSError:
-        return hashlib.sha256(hostname.encode()).hexdigest()[:32]
+        body = json.dumps(data).encode()
+        req  = urllib.request.Request(f"{server}{path}", data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        return {"error": str(e)}
 
 
-def generate_vpn_ip(node_id: str) -> str:
-    """Generate VPN IP from node_id"""
-    h = hashlib.sha256(node_id.encode()).digest()
-    return f"10.99.{h[0]}.{h[1]}"
+# ── WireGuard interface management ────────────────────────────────────
+
+def _wg_iface() -> str:
+    """Detect active WireGuard interface name (no sudo needed)."""
+    import glob
+    socks = glob.glob("/var/run/wireguard/*.sock")
+    if socks:
+        return os.path.basename(sorted(socks)[0]).replace(".sock", "")
+    wg = find_bin("wg")
+    out, _, _ = _run(f"sudo -n {wg} show interfaces 2>/dev/null")
+    if out and "sudo" not in out.lower() and "password" not in out.lower():
+        parts = out.split()
+        if parts:
+            return parts[0]
+    if sys.platform != "darwin":
+        out, _, _ = _run("ip link show 2>/dev/null")
+        for token in out.split():
+            name = token.rstrip(":")
+            if name.startswith(("wg", "wire")):
+                return name
+    return ""
 
 
-class WireGuardManager:
-    """WireGuard interface management"""
+def _load_or_create_keys(config_dir: str) -> tuple:
+    """Returns (private_key, public_key). Creates if not present."""
+    os.makedirs(config_dir, exist_ok=True)
+    priv_path = os.path.join(config_dir, "private.key")
+    pub_path  = os.path.join(config_dir, "public.key")
+    wg = find_bin("wg")
 
-    def __init__(self, interface: str, config_dir: str):
-        self.interface = interface
-        self.config_dir = config_dir
-        self.private_key = ""
-        self.public_key = ""
-        os.makedirs(config_dir, exist_ok=True)
+    if os.path.exists(priv_path) and os.path.exists(pub_path):
+        priv = open(priv_path).read().strip()
+        pub  = open(pub_path).read().strip()
+    else:
+        priv, _, _ = _run(f"{wg} genkey", check=True)
+        pub,  _, _ = _run(f"echo '{priv}' | {wg} pubkey", check=True)
+        with open(priv_path, "w") as f: f.write(priv + "\n")
+        with open(pub_path,  "w") as f: f.write(pub  + "\n")
+        os.chmod(priv_path, 0o600)
 
-    def load_or_create_keys(self):
-        """Load or generate keys"""
-        priv_path = os.path.join(self.config_dir, "private.key")
-        pub_path = os.path.join(self.config_dir, "public.key")
-
-        if os.path.exists(priv_path) and os.path.exists(pub_path):
-            self.private_key = open(priv_path).read().strip()
-            self.public_key = open(pub_path).read().strip()
-        else:
-            self.private_key = run("wg genkey")
-            self.public_key = run(f"echo '{self.private_key}' | wg pubkey")
-            open(priv_path, "w").write(self.private_key)
-            open(pub_path, "w").write(self.public_key)
-            os.chmod(priv_path, 0o600)
-
-        print(f"Public Key: {self.public_key}")
-
-    def setup_interface(self, vpn_ip: str, listen_port: int):
-        """Setup interface"""
-        is_macos = sys.platform == "darwin"
-
-        if is_macos:
-            wg_go = "/opt/homebrew/bin/wireguard-go"
-            sock_dir = "/var/run/wireguard"
-            os.makedirs(sock_dir, exist_ok=True)
-
-            run(f"rm -f {sock_dir}/{self.interface}.sock", check=False)
-            run(f"pkill -f 'wireguard-go.*{self.interface}'", check=False)
-            time.sleep(0.5)
-
-            utun_name = "utun9"
-            run(f"rm -f {sock_dir}/{utun_name}.sock", check=False)
-            run(f"pkill -f 'wireguard-go.*{utun_name}'", check=False)
-
-            import subprocess as sp
-            proc = sp.Popen([wg_go, utun_name], stdout=sp.PIPE, stderr=sp.PIPE)
-            time.sleep(1)
-
-            wg_dir = "/etc/wireguard"
-            os.makedirs(wg_dir, exist_ok=True)
-            conf = f"[Interface]\nPrivateKey = {self.private_key}\nListenPort = {listen_port}\n"
-            conf_path = f"{wg_dir}/{utun_name}.conf"
-            open(conf_path, "w").write(conf)
-            os.chmod(conf_path, 0o600)
-
-            run(f"wg setconf {utun_name} {conf_path}")
-            run(f"ifconfig {utun_name} inet {vpn_ip} {vpn_ip} netmask 255.255.0.0")
-            run(f"route delete -net 10.99.0.0/16 2>/dev/null", check=False)
-            run(f"route add -net 10.99.0.0/16 -interface {utun_name}")
-            self.interface = utun_name
-        else:
-            run(f"ip link delete {self.interface} 2>/dev/null", check=False)
-            run(f"ip link add {self.interface} type wireguard")
-            run(f"ip addr add {vpn_ip}/16 dev {self.interface}")
-
-            wg_dir = "/etc/wireguard"
-            os.makedirs(wg_dir, exist_ok=True)
-            conf = f"[Interface]\nPrivateKey = {self.private_key}\nListenPort = {listen_port}\n"
-            conf_path = f"{wg_dir}/{self.interface}.conf"
-            open(conf_path, "w").write(conf)
-            os.chmod(conf_path, 0o600)
-
-            run(f"wg setconf {self.interface} {conf_path}")
-            run(f"ip link set {self.interface} up")
-
-        print(f"Interface {self.interface} up with {vpn_ip}")
-
-    def add_peer(self, public_key: str, endpoint: str, allowed_ips: str):
-        """Add/update peer"""
-        cmd = f"wg set {self.interface} peer {public_key} allowed-ips {allowed_ips} persistent-keepalive 25"
-        if endpoint:
-            cmd += f" endpoint {endpoint}"
-        run(cmd, check=False)
-
-    def remove_peer(self, public_key: str):
-        """Remove peer"""
-        run(f"wg set {self.interface} peer {public_key} remove", check=False)
-
-    def get_peers(self) -> dict:
-        """Current peer list"""
-        result = {}
-        try:
-            output = run(f"wg show {self.interface} dump", check=False)
-            for line in output.split("\n")[1:]:
-                parts = line.split("\t")
-                if len(parts) >= 5:
-                    pub_key = parts[0]
-                    result[pub_key] = {
-                        "endpoint": parts[2] if parts[2] != "(none)" else "",
-                        "allowed_ips": parts[3],
-                        "latest_handshake": int(parts[4]) if parts[4] != "0" else 0,
-                    }
-        except (subprocess.SubprocessError, OSError) as e:
-            pass  # e silenced
-        return result
-
-    def cleanup(self):
-        """Delete interface"""
-        run(f"ip link delete {self.interface} 2>/dev/null", check=False)
+    return priv, pub
 
 
-class Wire:
-    """wire main class - autonomous mesh network"""
+def _setup_interface(iface: str, vpn_ip: str, listen_port: int, private_key: str):
+    """Bring up WireGuard interface."""
+    wg     = find_bin("wg")
+    wg_dir = "/etc/wireguard"
+    os.makedirs(wg_dir, exist_ok=True)
 
-    def __init__(self, server_url: str, listen_port: int = 51820, config_dir: str = None):
-        self.server_url = server_url.rstrip("/")
-        self.listen_port = listen_port
-        self.config_dir = config_dir or os.path.expanduser("~/.wire")
-        self.node_id = generate_node_id()
-        self.vpn_ip = generate_vpn_ip(self.node_id)
-        self.lan_ip = detect_lan_ip()
-        self.public_ip = ""
-        self.running = False
+    conf = (
+        f"[Interface]\n"
+        f"PrivateKey = {private_key}\n"
+        f"ListenPort = {listen_port}\n"
+    )
 
-        # Connection state tracking
-        self.direct_peers = {}      # {vpn_ip: {"pub_key": ..., "endpoint": ..., "status": "ok"|"fail"}}
-        self.current_relay = None   # Current relay in use VPN IP
+    if sys.platform == "darwin":
+        wg_go   = find_bin("wireguard-go")
+        utun    = "utun9"
+        sock_dir = "/var/run/wireguard"
+        os.makedirs(sock_dir, exist_ok=True)
 
-        self.wg = WireGuardManager(INTERFACE, self.config_dir)
+        _run(f"pkill -f 'wireguard-go.*{utun}' 2>/dev/null")
+        _run(f"rm -f {sock_dir}/{utun}.sock")
+        time.sleep(0.5)
 
-    @property
-    def is_relay(self) -> bool:
-        """Am I a relay server?"""
-        return any(r["vpn_ip"] == self.vpn_ip for r in RELAY_CANDIDATES)
+        subprocess.Popen([wg_go, utun], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1.5)
 
-    def api(self, method: str, path: str, data: dict = None) -> dict:
-        """API call - Multi-server failover"""
-        # Try current server first, then others on failure
-        servers = [self.server_url] + [s for s in SERVER_URLS if s != self.server_url]
+        conf_path = f"{wg_dir}/{utun}.conf"
+        with open(conf_path, "w") as f: f.write(conf)
+        os.chmod(conf_path, 0o600)
 
-        for server_url in servers:
-            url = f"{server_url}{path}"
-            req = urllib.request.Request(url, method=method)
-            req.add_header("Content-Type", "application/json")
-            body = json.dumps(data).encode() if data else None
-            try:
-                with urllib.request.urlopen(req, body, timeout=5) as resp:
-                    result = json.loads(resp.read())
-                    # Set this server as default on success
-                    if server_url != self.server_url:
-                        print(f"[FAILOVER] Server changed: {self.server_url} → {server_url}")
-                        self.server_url = server_url
-                    return result
-            except Exception as e:
-                if server_url == servers[-1]:
-                    print(f"[ERROR] All servers failed: {e}")
-                continue
-        return {}
+        _run(f"{wg} setconf {utun} {conf_path}", check=True)
+        _run(f"ifconfig {utun} inet {vpn_ip} {vpn_ip} netmask 255.255.0.0", check=True)
+        _run(f"route delete -net 10.99.0.0/16 2>/dev/null")
+        _run(f"route add -net 10.99.0.0/16 -interface {utun}", check=True)
+        return utun
+    else:
+        _run(f"ip link delete {iface} 2>/dev/null")
+        _run(f"ip link add {iface} type wireguard", check=True)
+        _run(f"ip addr add {vpn_ip}/16 dev {iface}", check=True)
 
-    def register(self):
-        """Register with server"""
-        result = self.api("POST", "/register", {
-            "node_id": self.node_id,
-            "port": self.listen_port,
-            "wg_public_key": self.wg.public_key,
-            "lan_ip": self.lan_ip,
-        })
-        if result.get("ok"):
-            self.public_ip = result.get("your_ip", "")
-        return result.get("ok", False)
+        conf_path = f"{wg_dir}/{iface}.conf"
+        with open(conf_path, "w") as f: f.write(conf)
+        os.chmod(conf_path, 0o600)
 
-    def refresh_peers(self):
-        """Refresh peer list - autonomous mesh"""
-        result = self.api("GET", "/peers")
-        peers = result.get("peers", [])
+        _run(f"{wg} setconf {iface} {conf_path}", check=True)
+        _run(f"ip link set {iface} up", check=True)
+        return iface
 
-        # SSOT: Server is source of truth - replace local peer on key mismatch
-        server_map = {p["vpn_ip"]: p["wg_public_key"] for p in peers}
-        current_wg = self.wg.get_peers()
 
-        for pub_key, info in list(current_wg.items()):
-            allowed_ips = info.get("allowed_ips", "")
-            # Skip relay peers
-            if "/16" in allowed_ips:
-                continue
-            # /32 Extract peer VPN IP
-            for ip_range in allowed_ips.split(","):
-                ip = ip_range.strip().split("/")[0]
-                if ip.startswith("10.99."):
-                    # Server has same IP but different key -> delete
-                    if ip in server_map and server_map[ip] != pub_key:
-                        print(f"[SSOT] Key mismatch: delete old key")
-                        self.wg.remove_peer(pub_key)
-                    # IP not in server list -> delete
-                    elif ip not in server_map and ip != self.vpn_ip:
-                        print(f"[SSOT] Not in server list: delete peer")
-                        self.wg.remove_peer(pub_key)
-                    break
+def _teardown_interface(iface: str):
+    wg = find_bin("wg")
+    if sys.platform == "darwin":
+        _run(f"pkill -f 'wireguard-go.*{iface}' 2>/dev/null")
+        _run(f"rm -f /var/run/wireguard/{iface}.sock 2>/dev/null")
+        _run(f"route delete -net 10.99.0.0/16 2>/dev/null")
+    else:
+        _run(f"ip link delete {iface} 2>/dev/null")
 
-        if self.is_relay:
-            # Relay mode: setup VPS nodes and fallback
-            vps_ips = {r["vpn_ip"] for r in RELAY_CANDIDATES}
-            peer_map = {p["vpn_ip"]: p for p in peers}
-            count = 0
 
-            # 1. Direct connect to other VPS nodes
-            for peer in peers:
-                if peer["node_id"] == self.node_id:
-                    continue
-                if peer["vpn_ip"] in vps_ips:
-                    endpoint = f"{peer['public_ip']}:{peer['port']}"
-                    self.wg.add_peer(peer["wg_public_key"], endpoint, f"{peer['vpn_ip']}/32")
-                    count += 1
+def _add_peer(iface: str, pub_key: str, vpn_ip: str, endpoint: str = ""):
+    wg  = find_bin("wg")
+    cmd = f"{wg} set {iface} peer {pub_key} allowed-ips {vpn_ip}/32 persistent-keepalive 25"
+    if endpoint:
+        cmd += f" endpoint {endpoint}"
+    _run(cmd)
 
-            # 2. Add primary relay for NAT node reach
-            # Only if not relay1
-            primary = RELAY_CANDIDATES[0]
-            if primary["vpn_ip"] != self.vpn_ip and primary["vpn_ip"] in peer_map:
-                p = peer_map[primary["vpn_ip"]]
-                endpoint = f"{p['public_ip']}:{p['port']}"
-                # Add to relay1 for NAT node traffic
-                self.wg.add_peer(p["wg_public_key"], endpoint, "10.99.0.0/16")
 
-            return f"[RELAY] {count} VPS peers"
-        else:
-            return self._refresh_as_client(peers)
+def _sync_peers(iface: str, server: str, my_node_id: str):
+    """Pull peers from server and apply to WireGuard interface."""
+    data = api_get(server, "/peers")
+    peers = data.get("peers", [])
+    wg = find_bin("wg")
 
-    def _refresh_as_client(self, peers: list) -> str:
-        """Refresh peers as regular client"""
-        peer_map = {p["vpn_ip"]: p for p in peers}
-        current_wg = self.wg.get_peers()
-        now = time.time()
-
-        direct_ok = 0
-        direct_fail = 0
-
-        # 1. Try direct connection to all non-relay peers
-        for peer in peers:
-            if peer["node_id"] == self.node_id:
-                continue
-            vpn_ip = peer["vpn_ip"]
-            pub_key = peer["wg_public_key"]
-
-            # Process relays later
-            if any(r["vpn_ip"] == vpn_ip for r in RELAY_CANDIDATES):
-                continue
-
-            # All non-relay peers via relay
-            direct_fail += 1
+    for p in peers:
+        if p.get("node_id") == my_node_id:
             continue
+        pub_key  = p.get("wg_public_key", "")
+        vpn_ip   = p.get("vpn_ip", "")
+        pub_ip   = p.get("public_ip", "")
+        port     = p.get("port", 51820)
+        if not pub_key or not vpn_ip:
+            continue
+        endpoint = f"{pub_ip}:{port}" if pub_ip else ""
+        _add_peer(iface, pub_key, vpn_ip, endpoint)
 
-            # Check existing handshake
-            if pub_key in current_wg:
-                hs = current_wg[pub_key]["latest_handshake"]
-                if hs > 0 and (now - hs) < HANDSHAKE_TIMEOUT:
-                    # Direct connection working
-                    direct_ok += 1
-                    self.direct_peers[vpn_ip] = {"status": "ok", "pub_key": pub_key}
-                    self.wg.add_peer(pub_key, endpoint, f"{vpn_ip}/32")
-                    continue
+    return len(peers)
 
-            # New peer or handshake failed -> try direct
-            if vpn_ip not in self.direct_peers or self.direct_peers[vpn_ip]["status"] != "fail":
-                self.wg.add_peer(pub_key, endpoint, f"{vpn_ip}/32")
-                self.direct_peers[vpn_ip] = {"status": "trying", "pub_key": pub_key, "since": now}
-            else:
-                # Already marked failed -> remove for relay
-                direct_fail += 1
-                if pub_key in current_wg and "/32" in current_wg[pub_key]["allowed_ips"]:
-                    self.wg.remove_peer(pub_key)
 
-        # 2. Add relay candidates directly (VPS only)
-        # NAT nodes route via relay1 only
-        if self.is_relay:  # Only VPS nodes connect to other VPS directly
-            peer_map = {p["vpn_ip"]: p for p in peers}
-            for candidate in RELAY_CANDIDATES:
-                vpn_ip = candidate["vpn_ip"]
-                if vpn_ip == self.vpn_ip:
-                    continue
-                if vpn_ip in peer_map:
-                    p = peer_map[vpn_ip]
-                    endpoint = f"{p['public_ip']}:{p['port']}"
-                    self.wg.add_peer(p["wg_public_key"], endpoint, f"{vpn_ip}/32")
+# ── Core commands (shared by CLI and MCP) ─────────────────────────────
 
-        # 3. Add main relay (for NAT nodes)
-        relay = self._select_relay(peers, current_wg)
-        if relay:
-            endpoint = f"{relay['public_ip']}:{relay['port']}"
-            self.wg.add_peer(relay["wg_public_key"], endpoint, "10.99.0.0/16")
-            self.current_relay = relay["vpn_ip"]
+def cmd_status(server_url: str = None) -> dict:
+    """
+    Query server /status and return structured data.
+    CLI prints tailscale-style table. MCP returns the dict.
+    """
+    server = get_server_url(server_url)
+    data   = api_get(server, "/status", timeout=5)
+
+    if "error" in data:
+        return {"ok": False, "error": data["error"], "server": server}
+
+    nodes   = data.get("nodes", [])
+    cfg     = load_config()
+    my_id   = cfg.get("node_id", generate_node_id())
+    my_name = cfg.get("node_name", "")
+
+    result = {
+        "ok":      True,
+        "server":  server,
+        "version": data.get("version", "?"),
+        "total":   data.get("total", 0),
+        "online":  data.get("online", 0),
+        "offline": data.get("offline", 0),
+        "nodes":   nodes,
+        "my_node_id": my_id,
+    }
+    return result
+
+
+def _print_status(data: dict):
+    """Print tailscale-style status table to stdout."""
+    if not data.get("ok"):
+        print(f"Error: {data.get('error', 'unknown')}")
+        print(f"Server: {data.get('server', '?')}")
+        print("Is the wire server running?")
+        return
+
+    nodes   = data.get("nodes", [])
+    my_id   = data.get("my_node_id", "")
+
+    GREEN  = "\033[32m"
+    GRAY   = "\033[90m"
+    BOLD   = "\033[1m"
+    RESET  = "\033[0m"
+
+    print(f"\n{BOLD}wire status{RESET}  {data['server']}")
+    print(f"  {data['online']} online / {data['offline']} offline / {data['total']} total\n")
+
+    for n in nodes:
+        status  = n.get("status", "offline")
+        name    = n.get("node_name") or n.get("node_id", "")[:12]
+        vpn_ip  = n.get("vpn_ip", "")
+        pub_ip  = n.get("public_ip", "")
+        ago     = n.get("last_seen_ago", -1)
+        is_me   = n.get("node_id", "") == my_id
+
+        if status == "online":
+            dot   = f"{GREEN}●{RESET}"
+            color = GREEN
         else:
-            self.current_relay = None
+            dot   = f"{GRAY}○{RESET}"
+            color = GRAY
 
-        return f"direct:{direct_ok} relay:{direct_fail}"
+        me_tag = f" {BOLD}(this node){RESET}" if is_me else ""
 
-    def _select_relay(self, peers: list, current_wg: dict) -> dict:
-        """Select relay to use"""
-        peer_map = {p["vpn_ip"]: p for p in peers}
-        now = time.time()
+        if ago < 0:
+            seen = "never"
+        elif ago < 60:
+            seen = f"{ago}s ago"
+        elif ago < 3600:
+            seen = f"{ago//60}m ago"
+        else:
+            seen = f"{ago//3600}h ago"
 
-        # Keep current working relay
-        for pub_key, info in current_wg.items():
-            if "/16" in info["allowed_ips"] and info["latest_handshake"] > 0:
-                if (now - info["latest_handshake"]) < HANDSHAKE_TIMEOUT:
-                    for p in peers:
-                        if p["wg_public_key"] == pub_key:
-                            return p
+        print(f"  {dot} {color}{name:<16}{RESET}  {vpn_ip:<16}  {pub_ip:<20}  {seen}{me_tag}")
 
-        # Select new relay from candidates
-        for candidate in RELAY_CANDIDATES:
-            vpn_ip = candidate["vpn_ip"]
-            if vpn_ip == self.vpn_ip:
-                continue
-            if vpn_ip in peer_map:
-                return peer_map[vpn_ip]
+    print()
 
-        return None
 
-    def check_peer_health(self):
-        """Check peer connection status"""
-        current = self.wg.get_peers()
-        now = time.time()
+def cmd_up(name: str = None, server: str = None, port: int = WG_LISTEN_PORT,
+           config_dir: str = None) -> dict:
+    """
+    Bring up WireGuard interface and start daemon.
+    Saves config for future runs.
+    """
+    if os.geteuid() != 0:
+        return {"ok": False, "error": "Must run as root (sudo wire up ...)"}
 
-        for vpn_ip, info in list(self.direct_peers.items()):
-            pub_key = info.get("pub_key")
-            if not pub_key or pub_key not in current:
-                continue
+    cfg         = load_config()
+    server      = (server or cfg.get("server_url", "")).rstrip("/")
+    node_name   = name or cfg.get("node_name", socket.gethostname())
+    config_dir  = config_dir or (CONFIG_PATHS[0].replace("/config.json", "") if os.geteuid() == 0
+                                 else CONFIG_PATHS[1].replace("/config.json", ""))
+    node_id     = cfg.get("node_id") or generate_node_id()
+    vpn_ip      = cfg.get("vpn_ip")  or generate_vpn_ip(node_id)
+    lan_ip      = detect_lan_ip()
 
-            wg_info = current[pub_key]
-            hs = wg_info["latest_handshake"]
+    if not server:
+        return {"ok": False, "error": "Server URL required. Use: wire up --server http://IP:8787 --name NAME"}
 
-            if info["status"] == "trying":
-                # Pending peer - check timeout
-                since = info.get("since", now)
-                if hs > 0 and (now - hs) < HANDSHAKE_TIMEOUT:
-                    self.direct_peers[vpn_ip]["status"] = "ok"
-                    print(f"  ✓ {vpn_ip} direct connected")
-                elif (now - since) > HANDSHAKE_TIMEOUT:
-                    self.direct_peers[vpn_ip]["status"] = "fail"
-                    print(f"  ✗ {vpn_ip} direct failed → relay")
+    # Save config
+    cfg.update({
+        "server_url": server,
+        "node_name":  node_name,
+        "node_id":    node_id,
+        "vpn_ip":     vpn_ip,
+        "listen_port": port,
+    })
+    save_config(cfg)
 
-            elif info["status"] == "ok":
-                # Existing connection - check if lost
-                if hs == 0 or (now - hs) > HANDSHAKE_TIMEOUT:
-                    self.direct_peers[vpn_ip]["status"] = "fail"
-                    print(f"  ✗ {vpn_ip} connection lost → relay")
+    # Keys
+    priv, pub = _load_or_create_keys(config_dir)
 
-    def retry_failed_peers(self):
-        """Retry direct connection to failed peers"""
-        retry_count = 0
-        for vpn_ip, info in self.direct_peers.items():
-            if info["status"] == "fail":
-                info["status"] = "trying"
-                info["since"] = time.time()
-                retry_count += 1
+    # Bring up interface
+    actual_iface = _setup_interface(INTERFACE, vpn_ip, port, priv)
 
-        if retry_count > 0:
-            print(f"  ↻ {retry_count} peers retry direct")
+    # Register with server
+    reg = api_post(server, "/register", {
+        "node_id":       node_id,
+        "node_name":     node_name,
+        "port":          port,
+        "wg_public_key": pub,
+        "lan_ip":        lan_ip,
+    })
+    if reg.get("error"):
+        return {"ok": False, "error": f"Registration failed: {reg['error']}"}
 
-    def start(self):
-        """Start VPN"""
-        mode = "[RELAY]" if self.is_relay else "[CLIENT]"
-        print(f"""
-╔═══════════════════════════════════════════╗
-║     wire {mode:8}              ║
-║     Autonomous WireGuard Mesh VPN             ║
-╚═══════════════════════════════════════════╝
+    # Sync peers
+    peer_count = _sync_peers(actual_iface, server, node_id)
 
-Server:    {self.server_url}
-Node ID:   {self.node_id[:16]}...
-VPN IP:    {self.vpn_ip}
-LAN IP:    {self.lan_ip or 'N/A'}
-Port:      {self.listen_port}
-""")
+    # Start daemon thread
+    _start_daemon(actual_iface, server, node_id, node_name, pub, port)
 
-        self.wg.load_or_create_keys()
-        self.wg.setup_interface(self.vpn_ip, self.listen_port)
+    result = {
+        "ok":         True,
+        "node_name":  node_name,
+        "node_id":    node_id,
+        "vpn_ip":     vpn_ip,
+        "interface":  actual_iface,
+        "server":     server,
+        "peers":      peer_count,
+    }
+    return result
 
-        if not self.register():
-            print("Failed to register with server")
-            self.wg.cleanup()
-            return
 
-        self.running = True
+def cmd_down() -> dict:
+    """Tear down WireGuard interface and stop daemon."""
+    if os.geteuid() != 0:
+        return {"ok": False, "error": "Must run as root"}
 
-        def shutdown(sig, frame):
-            print("\nShutting down...")
-            self.running = False
+    _stop_daemon()
 
-        signal.signal(signal.SIGINT, shutdown)
-        signal.signal(signal.SIGTERM, shutdown)
+    iface = _wg_iface() or INTERFACE
+    _teardown_interface(iface)
+    return {"ok": True, "message": f"Interface {iface} removed"}
 
-        print("\nRunning... (Ctrl+C to stop)\n")
-        last_refresh = 0
-        last_retry = time.time()
 
-        while self.running:
-            now = time.time()
+def cmd_peers(server_url: str = None) -> dict:
+    """List peers from server."""
+    server = get_server_url(server_url)
+    data   = api_get(server, "/peers", timeout=5)
+    return {"ok": True, "server": server, **data}
 
-            if now - last_refresh >= REFRESH_INTERVAL:
-                self.register()
-                status = self.refresh_peers()
-                self.check_peer_health()
-                relay_info = f" via {self.current_relay}" if self.current_relay else ""
-                print(f"[{time.strftime('%H:%M:%S')}] {status}{relay_info}")
-                last_refresh = now
 
-            # 5min retry direct connection
-            if now - last_retry >= RETRY_DIRECT_INTERVAL:
-                self.retry_failed_peers()
-                last_retry = now
+def cmd_ping(target: str, server_url: str = None, count: int = 4) -> dict:
+    """Ping a peer by VPN IP or node name."""
+    server = get_server_url(server_url)
+    data   = api_get(server, "/status", timeout=5)
+    nodes  = data.get("nodes", [])
 
-            time.sleep(1)
+    # Resolve name → VPN IP
+    vpn_ip = target
+    if not target.startswith("10."):
+        for n in nodes:
+            if n.get("node_name", "").lower() == target.lower():
+                vpn_ip = n.get("vpn_ip", target)
+                break
 
-        self.wg.cleanup()
-        print("Stopped")
+    out, _, rc = _run(f"ping -c {count} -W 2 {vpn_ip}", timeout=count * 3 + 5)
+    return {
+        "ok":     rc == 0,
+        "target": target,
+        "vpn_ip": vpn_ip,
+        "output": out,
+    }
 
+
+def cmd_install() -> dict:
+    """Install WireGuard tools for this platform."""
+    is_macos = sys.platform == "darwin"
+
+    wg = find_bin("wg")
+    out, _, rc = _run(f"{wg} --version 2>/dev/null || {wg} version 2>/dev/null")
+    if rc == 0 and out:
+        return {"ok": True, "status": "already_installed", "version": out.split("\n")[0]}
+
+    if is_macos:
+        wg_go = find_bin("wireguard-go")
+        go_ok = os.path.isfile(wg_go) and os.access(wg_go, os.X_OK)
+        if go_ok:
+            return {"ok": True, "status": "already_installed", "wireguard-go": wg_go}
+
+        instructions = (
+            "Install WireGuard on macOS:\n"
+            "  brew install wireguard-tools wireguard-go\n"
+            "\nOr via Mac App Store: WireGuard.app"
+        )
+    else:
+        distro, _, _ = _run("cat /etc/os-release 2>/dev/null | grep -i 'id=' | head -1")
+        if "ubuntu" in distro.lower() or "debian" in distro.lower():
+            instructions = (
+                "Install WireGuard on Debian/Ubuntu:\n"
+                "  sudo apt-get update && sudo apt-get install -y wireguard wireguard-tools"
+            )
+        elif "centos" in distro.lower() or "rhel" in distro.lower() or "fedora" in distro.lower():
+            instructions = (
+                "Install WireGuard on RHEL/Fedora:\n"
+                "  sudo dnf install -y wireguard-tools"
+            )
+        else:
+            instructions = (
+                "Install WireGuard:\n"
+                "  Debian/Ubuntu: apt install wireguard-tools\n"
+                "  RHEL/Fedora:   dnf install wireguard-tools\n"
+                "  Alpine:        apk add wireguard-tools"
+            )
+
+    return {"ok": False, "status": "not_installed", "instructions": instructions}
+
+
+# ── Daemon ────────────────────────────────────────────────────────────
+
+_daemon_thread = None
+_daemon_stop   = threading.Event()
+
+
+def _daemon_loop(iface: str, server: str, node_id: str, node_name: str,
+                 pub_key: str, listen_port: int):
+    """Background thread: heartbeat + peer sync every REFRESH_INTERVAL seconds."""
+    lan_ip = detect_lan_ip()
+    while not _daemon_stop.is_set():
+        try:
+            api_post(server, "/register", {
+                "node_id":       node_id,
+                "node_name":     node_name,
+                "port":          listen_port,
+                "wg_public_key": pub_key,
+                "lan_ip":        lan_ip,
+            })
+            _sync_peers(iface, server, node_id)
+        except Exception:
+            pass
+        _daemon_stop.wait(REFRESH_INTERVAL)
+
+
+def _start_daemon(iface: str, server: str, node_id: str, node_name: str,
+                  pub_key: str, listen_port: int):
+    global _daemon_thread, _daemon_stop
+    _daemon_stop.clear()
+    _daemon_thread = threading.Thread(
+        target=_daemon_loop,
+        args=(iface, server, node_id, node_name, pub_key, listen_port),
+        daemon=True,
+        name="wire-daemon",
+    )
+    _daemon_thread.start()
+
+
+def _stop_daemon():
+    global _daemon_stop
+    _daemon_stop.set()
+
+
+# ── CLI ───────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="wire VPN client")
-    parser.add_argument("--server", "-s", required=True, help="Server URL (http://IP:PORT)")
-    parser.add_argument("--port", "-p", type=int, default=51820, help="WireGuard listen port")
-    parser.add_argument("--config", "-c", help="Config directory")
+    parser = argparse.ArgumentParser(
+        description="wire - WireGuard mesh VPN",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  wire up --server http://10.0.0.1:8787 --name mynode\n"
+            "  wire status\n"
+            "  wire peers\n"
+            "  wire ping g1\n"
+            "  wire down\n"
+        ),
+    )
+    parser.add_argument("--version", action="version", version=f"wire v{VERSION}")
+    sub = parser.add_subparsers(dest="cmd", metavar="COMMAND")
+
+    # status
+    p_st = sub.add_parser("status", help="Show network status")
+    p_st.add_argument("--server", "-s", help="Server URL")
+    p_st.add_argument("--json", action="store_true", help="JSON output")
+
+    # up
+    p_up = sub.add_parser("up", help="Bring up VPN tunnel")
+    p_up.add_argument("--server", "-s", help="Server URL (e.g. http://IP:8787)")
+    p_up.add_argument("--name",   "-n", help="Node name (default: hostname)")
+    p_up.add_argument("--port",   "-p", type=int, default=WG_LISTEN_PORT, help="WireGuard listen port")
+
+    # down
+    sub.add_parser("down", help="Tear down VPN tunnel")
+
+    # peers
+    p_pr = sub.add_parser("peers", help="List peers from server")
+    p_pr.add_argument("--server", "-s", help="Server URL")
+    p_pr.add_argument("--json", action="store_true", help="JSON output")
+
+    # ping
+    p_pg = sub.add_parser("ping", help="Ping a peer")
+    p_pg.add_argument("target", help="Node name or VPN IP")
+    p_pg.add_argument("--server", "-s", help="Server URL")
+    p_pg.add_argument("--count", "-c", type=int, default=4, help="Ping count")
+
+    # install
+    sub.add_parser("install", help="Install WireGuard tools")
+
     args = parser.parse_args()
 
-    if os.geteuid() != 0:
-        print("Error: Must run as root (sudo)")
-        sys.exit(1)
+    if not args.cmd:
+        parser.print_help()
+        sys.exit(0)
 
-    client = Wire(args.server, args.port, args.config)
-    client.start()
+    if args.cmd == "status":
+        data = cmd_status(getattr(args, "server", None))
+        if getattr(args, "json", False):
+            print(json.dumps(data, indent=2))
+        else:
+            _print_status(data)
+
+    elif args.cmd == "up":
+        if os.geteuid() != 0:
+            print("Error: wire up requires root. Run: sudo wire up ...")
+            sys.exit(1)
+        result = cmd_up(
+            name=getattr(args, "name", None),
+            server=getattr(args, "server", None),
+            port=getattr(args, "port", WG_LISTEN_PORT),
+        )
+        if result.get("ok"):
+            print(f"✓ wire up: {result['node_name']} ({result['vpn_ip']}) ↔ {result['server']}")
+            print(f"  interface: {result['interface']}  peers synced: {result['peers']}")
+            print("  daemon running in background (heartbeat every 30s)")
+            # Block until signal
+            def _sig(s, f): cmd_down()
+            signal.signal(signal.SIGINT,  _sig)
+            signal.signal(signal.SIGTERM, _sig)
+            signal.pause()
+        else:
+            print(f"✗ {result.get('error', 'unknown error')}")
+            sys.exit(1)
+
+    elif args.cmd == "down":
+        if os.geteuid() != 0:
+            print("Error: wire down requires root")
+            sys.exit(1)
+        result = cmd_down()
+        print(f"✓ {result.get('message', 'done')}")
+
+    elif args.cmd == "peers":
+        data = cmd_peers(getattr(args, "server", None))
+        if getattr(args, "json", False):
+            print(json.dumps(data, indent=2))
+        else:
+            peers = data.get("peers", [])
+            print(f"\nPeers ({len(peers)}) from {data.get('server', '?')}:\n")
+            for p in peers:
+                name   = p.get("node_name") or p.get("node_id", "")[:12]
+                vpn_ip = p.get("vpn_ip", "")
+                pub_ip = p.get("public_ip", "")
+                print(f"  {name:<16}  {vpn_ip:<16}  {pub_ip}")
+            print()
+
+    elif args.cmd == "ping":
+        result = cmd_ping(args.target, getattr(args, "server", None), getattr(args, "count", 4))
+        print(result.get("output", ""))
+        sys.exit(0 if result.get("ok") else 1)
+
+    elif args.cmd == "install":
+        result = cmd_install()
+        if result.get("ok"):
+            print(f"✓ WireGuard already installed: {result.get('status')}")
+        else:
+            print(result.get("instructions", ""))
+            sys.exit(1)
 
 
 if __name__ == "__main__":
