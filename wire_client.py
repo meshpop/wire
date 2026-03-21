@@ -183,10 +183,10 @@ def discover_nat_port(server_host: str, stun_port: int,
         return result.get("ip", ""), int(result.get("port", wg_port))
     except OSError as e:
         # Port already in use — WireGuard may already be running
-        _log(f"[stun] bind :{wg_port} failed ({e}) — using port as-is")
+        pass  # Normal when wire is already running
         return "", wg_port
     except Exception as e:
-        _log(f"[stun] probe failed ({e}) — using port as-is")
+        pass  # STUN unavailable, use default port
         return "", wg_port
     finally:
         sock.close()
@@ -434,6 +434,34 @@ def _print_status(data: dict):
 
 
 
+def _auto_fix_service():
+    """
+    Auto-fix systemd service file if it points to a missing binary.
+    Called on every wire command — silently repairs broken installs after pip upgrade.
+    """
+    import platform, shutil
+    if platform.system() != "Linux" or os.geteuid() != 0:
+        return
+    service_path = "/etc/systemd/system/wire.service"
+    if not os.path.exists(service_path):
+        return
+    try:
+        with open(service_path) as f:
+            content = f.read()
+        # Detect broken patterns: old path or wrong port
+        needs_fix = (
+            "/opt/wire/client.py" in content or
+            "client.py" in content or
+            ":8786" in content
+        )
+        if needs_fix:
+            _install_systemd_service()
+            os.system("systemctl daemon-reload 2>/dev/null")
+            os.system("systemctl restart wire 2>/dev/null &")
+    except Exception:
+        pass
+
+
 def _install_systemd_service():
     """Write/update systemd service file so 'wire up' survives reboots and pip upgrades."""
     import shutil
@@ -511,9 +539,9 @@ def cmd_up(name: str = None, server: str = None, port: int = WG_LISTEN_PORT,
 
     ext_ip, nat_port = discover_nat_port(_server_host, _stun_port, port)
     if ext_ip:
-        _log(f"[stun] external UDP: {ext_ip}:{nat_port}")
+        pass  # NAT discovery succeeded
     else:
-        _log(f"[stun] could not discover NAT port, using {port}")
+        pass  # Use local port as fallback
         nat_port = port
 
     # Bring up interface
@@ -730,6 +758,10 @@ def main():
     sub.add_parser("install", help="Install WireGuard tools")
 
     args = parser.parse_args()
+
+    # Auto-fix broken service file on any wire command (root only)
+    # Handles the case where pip upgrade changed the binary path
+    _auto_fix_service()
 
     if not args.cmd:
         parser.print_help()
