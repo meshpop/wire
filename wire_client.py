@@ -28,7 +28,7 @@ import threading
 import urllib.request
 import urllib.error
 
-VERSION          = "2.2.6"
+VERSION          = "2.2.7"
 INTERFACE        = "wire0"
 REFRESH_INTERVAL = 30       # Heartbeat / peer sync every 30s
 PEER_OFFLINE_TTL = 300      # Seconds before marking peer offline in status display
@@ -418,6 +418,7 @@ def _print_status(data: dict):
     my_id   = data.get("my_node_id", "")
 
     GREEN  = "\033[32m"
+    CYAN   = "\033[36m"
     GRAY   = "\033[90m"
     BOLD   = "\033[1m"
     RESET  = "\033[0m"
@@ -433,14 +434,16 @@ def _print_status(data: dict):
         ago     = n.get("last_seen_ago", -1)
         is_me   = n.get("node_id", "") == my_id
 
-        if status == "online":
+        if is_me:
+            dot   = f"{CYAN}●{RESET}"
+            color = CYAN
+        elif status == "online":
             dot   = f"{GREEN}●{RESET}"
             color = GREEN
         else:
             dot   = f"{GRAY}○{RESET}"
             color = GRAY
 
-        me_tag = f" {BOLD}(this node){RESET}" if is_me else ""
 
         if ago < 0:
             seen = "never"
@@ -451,7 +454,7 @@ def _print_status(data: dict):
         else:
             seen = f"{ago//3600}h ago"
 
-        print(f"  {dot} {color}{name:<16}{RESET}  {vpn_ip:<16}  {pub_ip:<20}  {seen}{me_tag}")
+        print(f"  {dot} {color}{name:<16}{RESET}  {vpn_ip:<16}  {pub_ip:<20}  {seen}")
 
     print()
 
