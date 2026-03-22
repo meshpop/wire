@@ -28,7 +28,7 @@ import threading
 import urllib.request
 import urllib.error
 
-VERSION          = "2.2.7"
+VERSION          = "2.2.8"
 INTERFACE        = "wire0"
 REFRESH_INTERVAL = 30       # Heartbeat / peer sync every 30s
 PEER_OFFLINE_TTL = 300      # Seconds before marking peer offline in status display
@@ -357,15 +357,9 @@ def _sync_peers(iface: str, server: str, my_node_id: str):
         # Use nat_port if available (NAT-mapped external port from server)
         effective_port = p.get("nat_port") or port
         # LAN shortcut: use LAN IP directly when peer is on same /24 subnet
-        # This covers two cases:
-        #   1. Same-NAT (same public IP): classic hairpin NAT fix
-        #   2. Same-LAN/different-NAT: multiple NAT gateways on same physical LAN
-        #      (e.g. 175.194.155.63 and 183.98.133.35 both on 192.168.50.0/24)
-        my_lan_subnet = my_lan_ip.rsplit(".", 1)[0] if my_lan_ip else ""
-        peer_lan_subnet = lan_ip.rsplit(".", 1)[0] if lan_ip else ""
+        # Same-NAT (same public IP): hairpin NAT fix — use LAN IP directly
         use_lan = (lan_ip and not lan_ip.startswith("127.") and
-                   ((my_pub_ip and pub_ip == my_pub_ip) or
-                    (my_lan_subnet and peer_lan_subnet and my_lan_subnet == peer_lan_subnet)))
+                   my_pub_ip and pub_ip == my_pub_ip)
         if use_lan:
             endpoint = f"{lan_ip}:{port}"
         else:
