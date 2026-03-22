@@ -28,7 +28,7 @@ import threading
 import urllib.request
 import urllib.error
 
-VERSION          = "2.2.5"
+VERSION          = "2.2.6"
 INTERFACE        = "wire0"
 REFRESH_INTERVAL = 30       # Heartbeat / peer sync every 30s
 PEER_OFFLINE_TTL = 300      # Seconds before marking peer offline in status display
