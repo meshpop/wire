@@ -235,6 +235,9 @@ class Handler(BaseHTTPRequestHandler):
             requested_vpn_ip = body.get("vpn_ip", "").strip()
 
             public_ip = self.client_ip()
+            # If registering from localhost, use lan_ip as public IP (e.g. wire-server node)
+            if public_ip in ("127.0.0.1", "::1") and lan_ip:
+                public_ip = lan_ip
             now       = time.time()
 
             with lock:

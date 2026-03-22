@@ -335,18 +335,30 @@ def _sync_peers(iface: str, server: str, my_node_id: str):
     peers = data.get("peers", [])
     wg = find_bin("wg")
 
+    # Get our own public_ip to detect same-NAT peers
+    my_pub_ip = ""
+    for p in peers:
+        if p.get("node_id") == my_node_id:
+            my_pub_ip = p.get("public_ip", "")
+            break
+
     for p in peers:
         if p.get("node_id") == my_node_id:
             continue
         pub_key  = p.get("wg_public_key", "")
         vpn_ip   = p.get("vpn_ip", "")
         pub_ip   = p.get("public_ip", "")
+        lan_ip   = p.get("lan_ip", "")
         port     = p.get("port", 51820)
         if not pub_key or not vpn_ip:
             continue
         # Use nat_port if available (NAT-mapped external port from server)
         effective_port = p.get("nat_port") or port
-        endpoint = f"{pub_ip}:{effective_port}" if pub_ip else ""
+        # Same-NAT hairpin fix: if peer shares our public IP, use LAN IP directly
+        if my_pub_ip and pub_ip == my_pub_ip and lan_ip and not lan_ip.startswith("127."):
+            endpoint = f"{lan_ip}:{port}"
+        else:
+            endpoint = f"{pub_ip}:{effective_port}" if pub_ip else ""
         _add_peer(iface, pub_key, vpn_ip, endpoint)
 
     return len(peers)
