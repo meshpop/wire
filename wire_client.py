@@ -335,11 +335,13 @@ def _sync_peers(iface: str, server: str, my_node_id: str):
     peers = data.get("peers", [])
     wg = find_bin("wg")
 
-    # Get our own public_ip to detect same-NAT peers
+    # Get our own public_ip and lan_ip to detect same-NAT/same-LAN peers
     my_pub_ip = ""
+    my_lan_ip = ""
     for p in peers:
         if p.get("node_id") == my_node_id:
             my_pub_ip = p.get("public_ip", "")
+            my_lan_ip = p.get("lan_ip", "")
             break
 
     for p in peers:
@@ -354,8 +356,17 @@ def _sync_peers(iface: str, server: str, my_node_id: str):
             continue
         # Use nat_port if available (NAT-mapped external port from server)
         effective_port = p.get("nat_port") or port
-        # Same-NAT hairpin fix: if peer shares our public IP, use LAN IP directly
-        if my_pub_ip and pub_ip == my_pub_ip and lan_ip and not lan_ip.startswith("127."):
+        # LAN shortcut: use LAN IP directly when peer is on same /24 subnet
+        # This covers two cases:
+        #   1. Same-NAT (same public IP): classic hairpin NAT fix
+        #   2. Same-LAN/different-NAT: multiple NAT gateways on same physical LAN
+        #      (e.g. 175.194.155.63 and 183.98.133.35 both on 192.168.50.0/24)
+        my_lan_subnet = my_lan_ip.rsplit(".", 1)[0] if my_lan_ip else ""
+        peer_lan_subnet = lan_ip.rsplit(".", 1)[0] if lan_ip else ""
+        use_lan = (lan_ip and not lan_ip.startswith("127.") and
+                   ((my_pub_ip and pub_ip == my_pub_ip) or
+                    (my_lan_subnet and peer_lan_subnet and my_lan_subnet == peer_lan_subnet)))
+        if use_lan:
             endpoint = f"{lan_ip}:{port}"
         else:
             endpoint = f"{pub_ip}:{effective_port}" if pub_ip else ""
